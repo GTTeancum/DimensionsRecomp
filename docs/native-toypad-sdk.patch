@@ -1,0 +1,1754 @@
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index aef4a4d27f401f4ff04d2c24a2384e8dca7136ac..89e37cb9e5779dac7b900ce47967567c8a6e02e4 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -57,13 +57,33 @@ class InputSystem : public system::IInputSystem {
+   static void SetGuestInputBlocked(bool blocked);
+   /// X_INPUT_GAMEPAD_* bits held on any user, as of the guest's latest poll.
+   static uint16_t HeldButtons();
++  static uint16_t HeldButtons(uint32_t user_index);
++  // Signed left-stick X/Y packed into low/high 16 bits, from guest-side polling.
++  static uint32_t HeldLeftStick(uint32_t user_index);
++
++  // Host roster chord. Briefly arbitrate singles versus simultaneous presses.
++  // Configure before guest polling. Zero disables future opens. Existing
++  // ownership must still be released by the host. Default is disabled.
++  static void ConfigureNativeRosterChord(uint16_t modifier, uint16_t trigger);
++  // One-shot opening request, from one controller only; -1 means none.
++  // Input is already blocked when this request is published.
++  static int ConsumeNativeRosterOpenRequest(uint64_t* ticket = nullptr);
++  // Keyboard/host opening path; same ownership as a controller opening.
++  static bool RequestNativeRosterOpen(uint32_t user_index);
++  // Call after keyboard dismissal keys are up, with the consumed ticket.
++  // Releases global roster ownership and quarantines each user's future
++  // polls until neutral/disconnected. Stale tickets cannot close a new UI.
++  // This never clears the independent SetGuestInputBlocked owner.
++  static bool ReleaseNativeRosterInput(uint64_t ticket);
+ 
+   /// Raw non-controller HID device (the emulated LEGO Dimensions ToyPad),
+   /// reached from XamInputNonControllerGetRaw/SetRaw. Null when absent.
+-  Portal* GetPortal() const { return portal_.get(); }
++  Portal* GetPortal() const override { return portal_.get(); }
+   void SetPortal(std::unique_ptr<Portal> portal);
+ 
+  private:
++  X_RESULT GetStateInternal(uint32_t user_index, X_INPUT_STATE* out_state,
++                            bool consume_state_replay);
+   /// Re-enumerates every driver and notifies the assignment when the set
+   /// changed.
+   void RefreshDevices();
+diff --git a/include/rex/input/native_roster_bumper_keys.h b/include/rex/input/native_roster_bumper_keys.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..50017df4443c8aa7d46faddb9c3d34ab174f9dc9
+--- /dev/null
++++ b/include/rex/input/native_roster_bumper_keys.h
+@@ -0,0 +1,103 @@
++#pragma once
++#include <array>
++#include <cstdint>
++#include <deque>
++#include <mutex>
++#include <rex/input/native_roster_input_latch.h>
++
++namespace rex::input {
++// Both guest polling paths must feed every Sample, in sampling order. Raw
++// VK_PAD_L/RSHOULDER events must be discarded by the integration, not forwarded.
++// Queue reset/overflow retains only balancing ups for downs ALREADY delivered.
++class NativeRosterBumperKeys {
++ public:
++  struct Event { uint16_t virtual_key; uint16_t flags; };
++  static constexpr uint16_t kDown=1, kUp=2, kRepeat=4;
++  static constexpr uint16_t kLB=0x100, kRB=0x200, kMask=kLB|kRB;
++  static constexpr uint64_t kRepeatDelayMs=400, kRepeatPeriodMs=80;
++  static constexpr size_t kCapacity=64;
++
++  void Feed(uint32_t user, const NativeRosterInputLatch::Sample& sample,
++            uint64_t now, uint64_t stamp=0) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (user>=states_.size()) return;
++    auto& s=states_[user];
++    if (s.stamp!=stamp || sample.blocked || stamp) Reset(s,stamp);
++    if (sample.blocked || stamp) return;
++    const uint16_t held=sample.committed_buttons & kMask;
++    if (s.overflow) {
++      // Suppress the entire overflowing episode; do not re-emit held downs.
++      if (!held && !sample.committed_tap) s.overflow=false;
++      return;
++    }
++    for (unsigned i=0;i<2;++i) {
++      const uint16_t bit=Button(i);
++      if ((s.logical & bit) && !(held & bit))
++        if (!Push(s,bit,kUp)) return;
++    }
++    for (unsigned i=0;i<2;++i) {
++      const uint16_t bit=Button(i);
++      if (sample.committed_tap & bit) {
++        if (!Push(s,bit,kDown) || !Push(s,bit,kUp)) return;
++      }
++      if ((held & bit) && !(s.logical & bit)) {
++        if (!Push(s,bit,kDown)) return;
++        s.next_repeat[i]=now+kRepeatDelayMs;
++      } else if ((held & bit) && now>=s.next_repeat[i]) {
++        if (!Push(s,bit,kDown|kRepeat)) return;
++        // No catch-up flood after a pause; one repeat per observed period.
++        s.next_repeat[i]=now+kRepeatPeriodMs;
++      }
++    }
++    s.logical=held;
++  }
++
++  // Check fresh global blocked/stamp values at delivery time. Even while
++  // blocked this may return a balancing KEYUP, never a DOWN or REPEAT.
++  bool Pop(uint32_t user, Event* out, uint64_t stamp=0, bool blocked=false) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!out || user>=states_.size()) return false;
++    auto& s=states_[user];
++    if (s.stamp!=stamp || blocked || stamp) Reset(s,stamp);
++    if (s.queue.empty()) return false;
++    const auto e=s.queue.front(); s.queue.pop_front();
++    const auto bit=Mask(e.virtual_key);
++    if (e.flags & kUp) s.delivered &= ~bit;
++    else s.delivered |= bit;
++    *out=e;
++    return true;
++  }
++  bool Overflowed(uint32_t user) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return user<states_.size() && states_[user].overflow;
++  }
++
++ private:
++  struct State {
++    std::deque<Event> queue;
++    uint16_t logical=0, delivered=0;
++    uint64_t stamp=0;
++    std::array<uint64_t,2> next_repeat{};
++    bool overflow=false;
++  };
++  static uint16_t Button(unsigned i) { return i ? kRB : kLB; }
++  static uint16_t Key(uint16_t bit) { return bit==kLB ? 0x5805 : 0x5804; }
++  static uint16_t Mask(uint16_t key) { return key==0x5805 ? kLB : kRB; }
++  static void Reset(State& s, uint64_t stamp) {
++    s.queue.clear(); s.logical=0; s.next_repeat={}; s.stamp=stamp;
++    // Never invent a release for a DOWN that was only queued, not delivered.
++    for (unsigned i=0;i<2;++i)
++      if (s.delivered & Button(i)) s.queue.push_back({Key(Button(i)),kUp});
++  }
++  static bool Push(State& s, uint16_t bit, uint16_t flags) {
++    if (s.queue.size()>=kCapacity) {
++      Reset(s,s.stamp); s.overflow=true;
++      return false;
++    }
++    s.queue.push_back({Key(bit),flags});
++    return true;
++  }
++  mutable std::mutex mutex_;
++  std::array<State,NativeRosterInputLatch::kUsers> states_{};
++};
++} // namespace rex::input
+diff --git a/include/rex/input/native_roster_input_latch.h b/include/rex/input/native_roster_input_latch.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e7936376a772072ff3d3db6c3c50b7eafe01d6c
+--- /dev/null
++++ b/include/rex/input/native_roster_input_latch.h
+@@ -0,0 +1,405 @@
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <chrono>
++#include <mutex>
++
++namespace rex::input {
++
++enum class RosterQueuePoll { Event, Empty, Disconnected, Error };
++
++// Bounded work per guest call. Hitting the cap or an error never acknowledges
++// a flush: the next call continues draining, without forwarding old events.
++template <typename Poll>
++bool DrainRosterKeyQueue(Poll poll, uint32_t limit = 64) {
++  for (uint32_t i = 0; i < limit; ++i) {
++    switch (poll()) {
++      case RosterQueuePoll::Event: break;
++      case RosterQueuePoll::Empty:
++      case RosterQueuePoll::Disconnected: return true;
++      case RosterQueuePoll::Error: return false;
++    }
++  }
++  return false;
++}
++
++// Independent of drivers, UI, and guest structures; portable tests exercise
++// the state machine. Tokens are generation-stamped, not just user indices.
++class NativeRosterInputLatch {
++ public:
++  static constexpr uint32_t kUsers = 4;
++  static_assert(std::atomic<uint64_t>::is_always_lock_free,
++                "UI control plane requires lock-free 64-bit atomics");
++  struct Sample {
++    uint16_t guest_buttons;
++    bool blocked;
++    // For a future shared GetKeystroke bridge: current committed physical
++    // buttons and an instantaneous down/up tap committed by THIS observation.
++    // guest_buttons may additionally contain a GetState-only replay pulse.
++    uint16_t committed_buttons = 0;
++    uint16_t committed_tap = 0;
++  };
++  using Milliseconds = uint64_t;
++  static constexpr Milliseconds kGraceMs = 80;
++  static Milliseconds Now() {
++    return static_cast<Milliseconds>(std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++  }
++
++  // UI control plane: no guest mutex acquisition. The binding and its
++  // version publish together, so disable/re-enable cannot preserve a gesture.
++  void Configure(uint16_t modifier, uint16_t trigger) {
++    constexpr uint16_t supported = 0xF3FF;
++    const bool valid = modifier && trigger && !(modifier & trigger) &&
++                       !((modifier | trigger) & ~supported);
++    const uint32_t next = valid ? (uint32_t(modifier) << 16) | trigger : 0;
++    uint64_t old = binding_control_.load();
++    for (;;) {
++      if (uint32_t(old) == next) {
++        if (!next) CancelUnconsumed(false);
++        return;
++      }
++      const uint64_t value = ((old + (uint64_t(1) << 32)) & 0xFFFFFFFF00000000ull) | next;
++      if (binding_control_.compare_exchange_weak(old, value)) {
++        RequireDrain((generation_.fetch_add(1) + 1) * 2);
++        CancelUnconsumed(true);
++        return;
++      }
++    }
++  }
++
++  uint16_t ReservedButtons() const {
++    const uint32_t b = uint32_t(binding_control_.load());
++    return uint16_t(b >> 16) | uint16_t(b);
++  }
++
++  // The blocked bit and reset revision are one atomic snapshot. In particular,
++  // unblock cannot become visible before the invalidation that accompanies it.
++  void SetLegacyBlocked(bool blocked) {
++    uint64_t old = legacy_control_.load();
++    for (;;) {
++      if (bool(old & 1) == blocked) return;
++      const uint64_t next = ((old & ~uint64_t(1)) + 2) | uint64_t(blocked);
++      if (legacy_control_.compare_exchange_weak(old, next)) {
++        RequireDrain((generation_.fetch_add(1) + 1) * 2);
++        if (blocked) CancelUnconsumed(false);
++        return;
++      }
++    }
++  }
++  bool LegacyBlocked() const { return (legacy_control_.load() & 1) != 0; }
++
++#ifdef REX_NATIVE_ROSTER_TESTING
++  void TestAfterValidatedClaim(void (*fn)(void*), void* context) {
++    test_after_claim_ = fn; test_context_ = context;
++  }
++  void TestAfterConsumeClaim(void (*fn)(void*), void* context) {
++    test_after_consume_ = fn; test_consume_context_ = context;
++  }
++  template <typename F> void TestWithGuestMutationLock(F f) {
++    std::lock_guard<std::recursive_mutex> lock(guest_mutex_);
++    f();
++  }
++#endif
++
++  // Production calls use steady_clock; portable tests inject a monotonic time.
++  // Observe is a guest-side sample. A released pending tap is replayed for one
++  // state sample so that a tap shorter than the grace is not simply erased.
++  Sample Observe(uint32_t user, uint16_t raw, bool connected, bool legacy_blocked,
++                 Milliseconds now = Now(), bool consume_state_replay = true,
++                 bool analog_neutral = true) {
++    std::lock_guard<std::recursive_mutex> lock(guest_mutex_);
++    if (user >= kUsers) return {raw, legacy_blocked || Active()};
++    if (!connected) raw = 0;
++    const uint64_t binding_control = binding_control_.load();
++    const uint64_t reset_epoch = reset_epoch_.load();
++    const uint64_t legacy_control = legacy_control_.load();
++    legacy_blocked = legacy_blocked || bool(legacy_control & 1);
++    const bool control_changed = seen_binding_[user] != binding_control ||
++        seen_reset_[user] != reset_epoch || seen_legacy_[user] != legacy_control;
++    if (control_changed) {
++      ResetGesture(user);
++      seen_binding_[user] = binding_control;
++      seen_reset_[user] = reset_epoch;
++      seen_legacy_[user] = legacy_control;
++    }
++    const uint32_t binding = uint32_t(binding_control);
++    const uint16_t chord = uint16_t(binding >> 16) | uint16_t(binding);
++    uint64_t quarantine = quarantine_[user].load();
++    const bool was_blocked = control_changed || legacy_blocked || Active() || quarantine != 0;
++    auto& state = gestures_[user];
++    auto result = [&](uint16_t committed, uint16_t tap = 0) -> Sample {
++      // An overlapping control transition cannot return an old replay. Modal
++      // readiness is published only from a guest poll that returns suppression.
++      if (Blocked(user)) {
++        ResetGesture(user);
++        PublishReady();
++        return {0, true};
++      }
++      if (binding_control_.load() != binding_control || reset_epoch_.load() != reset_epoch ||
++          legacy_control_.load() != legacy_control) {
++        ResetGesture(user);
++        return {0, true};
++      }
++      replay_[user] |= tap;
++      uint16_t guest = uint16_t(committed | replay_[user]);
++      if (consume_state_replay) {
++        // A replayed released tap must have a visible release boundary even
++        // if a fresh physical press arrives in the very next guest poll.
++        const uint16_t release = release_next_[user];
++        guest &= ~release;
++        release_next_[user] = uint16_t(replay_[user] & ~committed & ~release);
++        replay_[user] = uint16_t((committed | replay_[user]) & release);
++      }
++      return {guest, false, committed, tap};
++    };
++    if (was_blocked) {
++      // Never preserve a pending replay across keyboard/legacy/modal entry.
++      state = {Phase::Pass, 0, 0};
++      replay_[user] = release_next_[user] = 0;
++      if ((!connected || (!raw && analog_neutral)) && quarantine) quarantine_[user].compare_exchange_strong(quarantine, 0);
++      if (!raw) state = {};
++      PublishReady();
++      return {0, true}; // the neutral quarantine-clearing poll remains blocked
++    }
++    if (!connected) {
++      state = {};
++      replay_[user] = release_next_[user] = 0;
++      return {0, false};
++    }
++    if (!chord) { state = {}; return result(raw); }
++    const uint16_t held = raw & chord;
++    if (state.phase == Phase::Pass) {
++      if (!held) state = {};
++      return result(raw);
++    }
++    if (state.phase == Phase::Idle) {
++      if (!held) return result(raw);
++      if (held == chord) {
++        if (OpenImpl(user, legacy_blocked, true, binding_control, reset_epoch, legacy_control)) {
++          ResetGesture(user);
++          PublishReady();
++          return {0, true};
++        }
++        return {0, Blocked(user)};
++      }
++      state = {Phase::Pending, held, now};
++      return result(uint16_t(raw & ~chord));
++    }
++    // Timeout wins at the exact boundary. A second bumper arriving at/after
++    // 80 ms cannot retroactively steal an ordinary singleton press.
++    const bool expired = now >= state.since && now - state.since >= kGraceMs;
++    if (!expired && held == chord) {
++      if (OpenImpl(user, legacy_blocked, true, binding_control, reset_epoch, legacy_control)) {
++          ResetGesture(user);
++          PublishReady();
++          return {0, true};
++        }
++      return {0, Blocked(user)};
++    }
++    if (expired || !(held & state.first)) {
++      const uint16_t first = state.first;
++      state = {Phase::Pass, 0, 0};
++      // Include the first button even if already released: exactly one state
++      // sample of down, followed by a real release on the next sample.
++      return result(raw, uint16_t(first & ~raw));
++    }
++    return result(uint16_t(raw & ~chord));
++  }
++
++  // Keyboard/host open is atomic and nonblocking. It acquires suppression
++  // immediately, but Consume cannot see it until a guest Observe acknowledges
++  // that barrier. UI callers must not wait synchronously for Consume to succeed.
++  bool Open(uint32_t user, bool legacy_blocked) {
++    return OpenImpl(user, legacy_blocked, false, binding_control_.load(),
++                    reset_epoch_.load(), legacy_control_.load());
++  }
++
++  // Readiness and consumption are phases in the same atomic ownership word.
++  // A separate pending store could resurrect a closed generation in a race.
++  int Consume(uint64_t* ticket) {
++    if (ticket) *ticket = 0;
++    uint64_t value = active_.load();
++    for (;;) {
++      if ((value & kPhaseMask) != kReady) return -1;
++      if (uint32_t(value >> 32) != uint32_t(binding_control_.load() >> 32) || LegacyBlocked()) {
++        CancelUnconsumed(false);
++        return -1;
++      }
++      const uint64_t base = value & ~kPhaseMask;
++      const uint64_t legacy = legacy_control_.load();
++      if (active_.compare_exchange_weak(value, base | kConsumed)) {
++#ifdef REX_NATIVE_ROSTER_TESTING
++        if (test_after_consume_) test_after_consume_(test_consume_context_);
++#endif
++        // Configure may publish between the first revision check and this CAS,
++        // then preserve Consumed. No caller has received this owner yet: reject
++        // it and close only this exact ticket before publishing the UI request.
++        if (uint32_t(base >> 32) != uint32_t(binding_control_.load() >> 32) ||
++            (legacy & 1) || legacy_control_.load() != legacy) {
++          CloseTicket(base, false);
++          return -1;
++        }
++        if (ticket) *ticket = base;
++        return int((base & 7) - 1);
++      }
++    }
++  }
++
++  // UI close never waits for guest mutation. A closing phase prevents a new
++  // open until every user's quarantine and drain stamp have been published.
++  bool Close(uint64_t ticket) {
++    if (!ticket || (ticket & kPhaseMask) || !(ticket & 7) || (ticket & 7) > kUsers)
++      return false;
++    return CloseTicket(ticket, false);
++  }
++
++  bool Active() const { return active_.load() != 0; }
++  bool Blocked(uint32_t user) const {
++    return Active() || (user < kUsers && quarantine_[user].load() != 0);
++  }
++  uint64_t DrainStamp(uint32_t user) const {
++    if (user >= kUsers) return 0;
++    const uint64_t required = drain_required_.load();
++    return drained_[user].load() < required ? required : 0;
++  }
++  bool CompleteDrain(uint32_t user, uint64_t stamp) {
++    if (user >= kUsers || !stamp || LegacyBlocked() || Blocked(user) || drain_required_.load() != stamp)
++      return false;
++    uint64_t old = drained_[user].load();
++    while (old < stamp && !drained_[user].compare_exchange_weak(old, stamp)) {}
++    // A newer required epoch cannot be cleared by acknowledging this old one.
++    return drain_required_.load() == stamp && !LegacyBlocked() && !Blocked(user);
++  }
++
++  // Classification only: callers MUST NOT discard every classified event.
++  // A committed singleton needs its down/up events delivered; only a successful
++  // chord or modal quarantine may consume the whole gesture.
++  // Constants are the documented VK_PAD values used by all SDK drivers.
++  bool ReservedKey(uint16_t key) const {
++    uint16_t mask = 0;
++    switch (key) {
++      case 0x5800: mask = 0x1000; break; // A
++      case 0x5801: mask = 0x2000; break;
++      case 0x5802: mask = 0x4000; break;
++      case 0x5803: mask = 0x8000; break;
++      case 0x5804: mask = 0x0200; break; // R shoulder
++      case 0x5805: mask = 0x0100; break;
++      case 0x5810: mask = 0x0001; break;
++      case 0x5811: mask = 0x0002; break;
++      case 0x5812: mask = 0x0004; break;
++      case 0x5813: mask = 0x0008; break;
++      case 0x5814: mask = 0x0010; break;
++      case 0x5815: mask = 0x0020; break; // Back
++      case 0x5816: mask = 0x0040; break;
++      case 0x5817: mask = 0x0080; break; // R thumb
++      default: break;
++    }
++    return (mask & ReservedButtons()) != 0;
++  }
++
++ private:
++  enum class Phase { Idle, Pending, Pass };
++  struct Gesture {
++    Phase phase = Phase::Idle;
++    uint16_t first = 0;
++    Milliseconds since = 0;
++  };
++  static constexpr uint64_t kInitializing = 8, kAwaitingPoll = 16,
++                            kReady = 32, kConsumed = 64, kClosing = 128;
++  static constexpr uint64_t kPhaseMask = 0xF8;
++  void ResetGesture(uint32_t user) {
++    gestures_[user] = {Phase::Pass, 0, 0};
++    replay_[user] = release_next_[user] = 0;
++  }
++  bool OpenImpl(uint32_t user, bool legacy_blocked, bool chord,
++                uint64_t binding, uint64_t reset, uint64_t legacy) {
++    if (user >= kUsers || legacy_blocked || (legacy & 1) || LegacyBlocked()) return false;
++    // Opaque tickets embed the binding revision plus a unique lifetime serial.
++    // Refuse rather than wrap after 16,777,215 control/open serial allocations.
++    const uint64_t serial = generation_.fetch_add(1) + 1;
++    if (serial > 0xFFFFFF) return false;
++    const uint64_t ticket = (binding & 0xFFFFFFFF00000000ull) | (serial << 8) | (user + 1);
++    uint64_t expected = 0;
++    if (!active_.compare_exchange_strong(expected, ticket | kInitializing)) return false;
++    if (binding_control_.load() != binding || legacy_control_.load() != legacy ||
++        (chord && (quarantine_[user].load() || reset_epoch_.load() != reset))) {
++      CloseTicket(ticket, true);
++      return false;
++    }
++#ifdef REX_NATIVE_ROSTER_TESTING
++    if (test_after_claim_) test_after_claim_(test_context_);
++#endif
++    RequireDrain(DrainEpoch(ticket, false));
++    expected = ticket | kInitializing;
++    return active_.compare_exchange_strong(expected, ticket | kAwaitingPoll);
++  }
++  void PublishReady() {
++    uint64_t value = active_.load();
++    if ((value & kPhaseMask) != kAwaitingPoll) return;
++    if (uint32_t(value >> 32) != uint32_t(binding_control_.load() >> 32) || LegacyBlocked()) {
++      CancelUnconsumed(false);
++      return;
++    }
++    active_.compare_exchange_strong(value, (value & ~kPhaseMask) | kReady);
++  }
++  void CancelUnconsumed(bool stale_binding_only) {
++    uint64_t value = active_.load();
++    for (;;) {
++      const uint64_t phase = value & kPhaseMask;
++      if (!value || phase == kConsumed || phase == kClosing) return;
++      if (stale_binding_only && uint32_t(value >> 32) == uint32_t(binding_control_.load() >> 32)) return;
++      const uint64_t ticket = value & ~kPhaseMask;
++      if (active_.compare_exchange_weak(value, ticket | kClosing)) {
++        FinishClose(ticket);
++        return;
++      }
++    }
++  }
++  bool CloseTicket(uint64_t ticket, bool allow_initializing) {
++    uint64_t expected = active_.load();
++    for (;;) {
++      if (!expected || (expected & ~kPhaseMask) != ticket ||
++          (!allow_initializing && (expected & kPhaseMask) == kInitializing) ||
++          (expected & kPhaseMask) == kClosing) return false;
++      if (active_.compare_exchange_weak(expected, ticket | kClosing)) break;
++    }
++    return FinishClose(ticket);
++  }
++  bool FinishClose(uint64_t ticket) {
++    const uint64_t closing = ticket | kClosing;
++    for (auto& q : quarantine_) q.store(closing);
++    RequireDrain(DrainEpoch(ticket, true));
++    reset_epoch_.fetch_add(1);
++    uint64_t expected = closing;
++    return active_.compare_exchange_strong(expected, 0);
++  }
++  static uint64_t DrainEpoch(uint64_t ticket, bool closed) {
++    // Binding versions need not define monotonic order; lifetime serial does.
++    return ((ticket >> 8) & 0xFFFFFF) * 2 + uint64_t(closed);
++  }
++#ifdef REX_NATIVE_ROSTER_TESTING
++  void (*test_after_claim_)(void*) = nullptr;
++  void* test_context_ = nullptr;
++  void (*test_after_consume_)(void*) = nullptr;
++  void* test_consume_context_ = nullptr;
++#endif
++  // Guest-only compound state. UI methods never acquire this mutex.
++  mutable std::recursive_mutex guest_mutex_;
++  std::array<uint64_t, kUsers> seen_binding_{}, seen_reset_{}, seen_legacy_{};
++  std::array<Gesture, kUsers> gestures_{};
++  std::array<uint16_t, kUsers> replay_{}, release_next_{};
++  void RequireDrain(uint64_t stamp) {
++    uint64_t old = drain_required_.load();
++    while (old < stamp && !drain_required_.compare_exchange_weak(old, stamp)) {}
++    // A canceled initializer resuming late cannot overwrite a newer close/open.
++
++  }
++  std::atomic<uint64_t> binding_control_{0}, reset_epoch_{0}, legacy_control_{0};
++  std::atomic<uint64_t> generation_{0}, active_{0};
++  std::atomic<uint64_t> drain_required_{0};
++  std::array<std::atomic<uint64_t>, kUsers> quarantine_{}, drained_{};
++};
++} // namespace rex::input
+diff --git a/include/rex/input/portal/emulated_toypad.h b/include/rex/input/portal/emulated_toypad.h
+index 6139983992f629d23d33977cdfc3ae7ebf77646a..ad485dfb7610be0679fffe3e9c152df3ded623dd 100644
+--- a/include/rex/input/portal/emulated_toypad.h
++++ b/include/rex/input/portal/emulated_toypad.h
+@@ -22,6 +22,7 @@
+ #include <vector>
+ 
+ #include <rex/input/portal/portal.h>
++#include <rex/input/portal/toypad_led_animation.h>
+ 
+ namespace rex::input {
+ 
+@@ -45,14 +46,7 @@ constexpr size_t kLedSnapshotSize = 4 + kLedRegionCount * kLedRegionStride;
+ enum class ToypadLedMode : uint8_t { Off = 0, Solid = 1, Flash = 2, Fade = 3 };
+ 
+ // One pad's last light command, held verbatim.
+-struct PadLed {
+-  uint8_t mode = static_cast<uint8_t>(ToypadLedMode::Off);
+-  uint8_t r = 0, g = 0, b = 0;
+-  // What the pad was showing when this command arrived. Real hardware fades
+-  // from it, so the app needs it to reproduce a cross-fade.
+-  uint8_t from_r = 0, from_g = 0, from_b = 0;
+-  uint8_t on_ticks = 0, off_ticks = 0, count = 0, speed_ticks = 0;
+-};
++struct PadLed : ToypadLightAnimation {};
+ 
+ struct ToypadFigure {
+   std::string file_path;  // optional .bin backing file, empty = in-memory only
+@@ -60,7 +54,10 @@ struct ToypadFigure {
+   uint8_t index = 255;  // 1-based slot index as reported to the game, 255=free
+   uint8_t pad = 255;    // 1=centre, 2=left, 3=right
+   uint32_t id = 0;
+-  void Save();
++  bool lifted = false;
++  bool persistence_failed = false; // New live bytes could not yet be saved.
++  // Failed persistence leaves the prior backing file intact.
++  bool Save();
+ };
+ 
+ // Emulated LEGO Dimensions ToyPad. Protocol logic is a port of the
+@@ -70,7 +67,8 @@ struct ToypadFigure {
+ // LegoToypad companion app (same wire contract as the Cemu/RPCS3 forks).
+ class EmulatedToypad final : public Portal {
+  public:
+-  EmulatedToypad();
++  explicit EmulatedToypad(bool start_companion_services = true);
++  EmulatedToypad* AsEmulatedToypad() override { return this; }
+   ~EmulatedToypad() override;
+ 
+   bool IsConnected() override { return true; }
+@@ -81,10 +79,24 @@ class EmulatedToypad final : public Portal {
+   // should not reach the game.
+   static bool IsPickerInputActive();
+ 
++  // Physical SDK slot order (0..6), captured under the figure-state lock.
++  std::array<bool, kToypadFigureCount> GetOccupancy();
++  // Nonblocking render-thread read. False leaves the caller's cache intact.
++  bool TryGetPadLightColors(std::array<ToypadRgb, 3>& colors);
++  struct FigureStatus { uint32_t model = 0; bool reserved = false, lifted = false, save_failed = false; };
++  bool TryGetFigureStatus(std::array<FigureStatus, 7>& status);
++  static uint32_t InspectFigureId(const std::array<uint8_t, kToypadTagSize>& tag) {
++    return GetFigureId(tag);
++  }
++
+   // Listener-driven state changes (called from the listener thread).
+   uint32_t LoadFigure(const std::array<uint8_t, kToypadTagSize>& buf, std::string file_path,
+                       uint8_t pad, uint8_t index, bool lock);
+   bool RemoveFigure(uint8_t pad, uint8_t index, bool full_remove, bool lock);
++  // Native owner-only removal: return the exact successfully persisted live
++  // bytes, never a model inferred from a potentially encrypted page write.
++  bool RemoveFigureNative(uint8_t pad, uint8_t index, const std::array<uint8_t, 7>& uid,
++                          std::array<uint8_t, kToypadTagSize>& saved);
+   bool TempRemove(uint8_t index);
+   bool CancelRemove(uint8_t index);
+   bool MoveFigure(uint8_t pad, uint8_t index, uint8_t old_pad, uint8_t old_index);
+@@ -145,6 +157,7 @@ class EmulatedToypad final : public Portal {
+   void ForgetClient(uintptr_t client_socket);
+   void PickerWatchRun();
+ 
++  const bool native_only_;
+   std::mutex state_lock_;
+   std::array<ToypadFigure, kToypadFigureCount> figures_{};
+   std::queue<std::array<uint8_t, 32>> responses_;
+diff --git a/include/rex/input/portal/portal.h b/include/rex/input/portal/portal.h
+index d580a84df4c7bdb104760311b1d2d8c4956928aa..335180419fe51fc85f49dd287ffc4ffa85550665 100644
+--- a/include/rex/input/portal/portal.h
++++ b/include/rex/input/portal/portal.h
+@@ -24,6 +24,8 @@ constexpr uint8_t kPortalBufferSize = 0x20;
+ // Base class for a "non-controller" raw HID device reachable through
+ // XamInputNonControllerGetRaw/SetRaw. Read/Write hold the device lock and
+ // track the previous status so the guest sees a state-change flag.
++class EmulatedToypad;
++
+ class Portal {
+  public:
+   Portal();
+@@ -31,6 +33,9 @@ class Portal {
+ 
+   virtual bool IsConnected() = 0;
+ 
++  // Optional typed host access; hardware portals keep the null default.
++  virtual EmulatedToypad* AsEmulatedToypad() { return nullptr; }
++
+   virtual X_STATUS Read(std::span<uint8_t> data, uint32_t& bytes_read, uint16_t& state);
+   virtual X_STATUS Write(std::span<uint8_t> data);
+ 
+diff --git a/include/rex/input/portal/toypad_led_animation.h b/include/rex/input/portal/toypad_led_animation.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..229a8f835ba9fc92f44b2ff68da123c14e235fe9
+--- /dev/null
++++ b/include/rex/input/portal/toypad_led_animation.h
+@@ -0,0 +1,50 @@
++#pragma once
++#include <array>
++#include <cmath>
++#include <cstdint>
++
++namespace rex::input {
++// Native presentation clock, independent of overlay lifetime and GET_LED's
++// eight-bit wire serial. Timing follows the companion's 40 ms calibration.
++struct ToypadLightAnimation {
++  uint8_t mode = 0;
++  uint8_t r = 0, g = 0, b = 0;
++  uint8_t from_r = 0, from_g = 0, from_b = 0;
++  uint8_t on_ticks = 0, off_ticks = 0, count = 0, speed_ticks = 0;
++  std::array<uint8_t, 3> base{};
++  uint64_t started_ms = 0, revision = 0;
++};
++using ToypadRgb = std::array<uint8_t, 3>;
++inline ToypadRgb EvaluateToypadLight(const ToypadLightAnimation& light, uint64_t now_ms) {
++  const ToypadRgb target{light.r, light.g, light.b};
++  const ToypadRgb source{light.from_r, light.from_g, light.from_b};
++  if (light.mode == 0) return {};
++  if (light.mode == 1) return target;
++  const uint64_t elapsed = now_ms >= light.started_ms ? now_ms - light.started_ms : 0;
++  if (light.mode == 2) {
++    const uint64_t on = uint64_t(light.on_ticks ? light.on_ticks : 1) * 40;
++    const uint64_t off = uint64_t(light.off_ticks ? light.off_ticks : 1) * 40;
++    const uint64_t period = on + off;
++    // Hardware-facing clients define count as transitions, not whole cycles.
++    // Odd counts end on the prior displayed colour; even on the target.
++    if (light.count && light.count != 255) {
++      const uint64_t end = uint64_t(light.count / 2) * period + (light.count % 2 ? on : 0);
++      if (elapsed >= end) return light.count % 2 ? source : target;
++    }
++    return elapsed % period < on ? target : source;
++  }
++  const uint64_t step = uint64_t(light.speed_ticks ? light.speed_ticks : 25) * 40;
++  uint64_t leg = elapsed / step;
++  if (light.count && leg >= light.count) return light.count % 2 ? target : source;
++  const double fraction = double(elapsed % step) / double(step);
++  // Companion-style smooth cross-fade; no bitmap-cache quantisation needed.
++  const double blend = .5 - .5 * std::cos(fraction * 3.14159265358979323846);
++  ToypadRgb result{};
++  for (size_t i = 0; i < 3; ++i) {
++    const double a = leg % 2 ? target[i] : source[i];
++    const double b = leg % 2 ? source[i] : target[i];
++    result[i] = static_cast<uint8_t>(a + (b - a) * blend + .5);
++  }
++  return result;
++}
++} // namespace rex::input
+diff --git a/include/rex/system/interfaces/input.h b/include/rex/system/interfaces/input.h
+index 6a6174392ba8180b2b1cdd507900c959e147e20d..ad727305dc3d597f99794cb3afb20b2167222055 100644
+--- a/include/rex/system/interfaces/input.h
++++ b/include/rex/system/interfaces/input.h
+@@ -13,6 +13,8 @@
+ 
+ #include <rex/system/xtypes.h>
+ 
++namespace rex::input { class Portal; }
++
+ namespace rex::system {
+ 
+ class IInputSystem {
+@@ -20,6 +22,7 @@ class IInputSystem {
+   virtual ~IInputSystem() = default;
+   virtual X_STATUS Setup() = 0;
+   virtual void Shutdown() = 0;
++  virtual rex::input::Portal* GetPortal() const { return nullptr; }
+ };
+ 
+ }  // namespace rex::system
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 2e4a11d2ae3d5a0d1b13a3a168e305e1ae16a7ab..2bd750feaa6e1b47d0f41de4fc8c0a8a55d14ab8 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -13,12 +13,16 @@
+ #include <array>
+ #include <atomic>
+ #include <cmath>
++#include <cstring>
++#include <mutex>
+ 
+ #include <rex/dbg.h>
+ #include <rex/input/device_assignment.h>
+ #include <rex/input/flags.h>
+ #include <rex/input/input_driver.h>
+ #include <rex/input/input_system.h>
++#include <rex/input/native_roster_input_latch.h>
++#include <rex/input/native_roster_bumper_keys.h>
+ #include <rex/input/mnk/mnk_input_driver.h>
+ #include <rex/input/nop/nop_input_driver.h>
+ #include <rex/input/portal/emulated_toypad.h>
+@@ -37,6 +41,10 @@ REXCVAR_DEFINE_BOOL(toypad_emulation, true, "Input",
+                     "Emulate the LEGO Dimensions ToyPad (with the companion-app listener) "
+                     "instead of passing through a physical portal over USB")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_BOOL(toypad_companion_services, true, "Input",
++                    "Start the emulated ToyPad companion listener and input watcher")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ namespace rex::input {
+ 
+ namespace {
+@@ -232,11 +240,19 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+ }
+ 
+ namespace {
+-std::atomic<bool> g_guest_input_blocked{false};
+ std::array<std::atomic<uint16_t>, 4> g_held_buttons{};
++NativeRosterInputLatch g_roster_input;
++NativeRosterBumperKeys g_roster_keys;
++std::recursive_mutex g_roster_poll_mutex;
++std::array<std::atomic<uint32_t>, 4> g_held_left_stick{};
++std::array<X_INPUT_GAMEPAD, 4> g_guest_gamepad{};
++std::array<uint32_t, 4> g_guest_packet{};
++std::array<bool, 4> g_guest_packet_valid{};
+ }  // namespace
+ 
+-void InputSystem::SetGuestInputBlocked(bool blocked) { g_guest_input_blocked.store(blocked); }
++void InputSystem::SetGuestInputBlocked(bool blocked) {
++  g_roster_input.SetLegacyBlocked(blocked);
++}
+ 
+ uint16_t InputSystem::HeldButtons() {
+   uint16_t buttons = 0;
+@@ -246,9 +262,48 @@ uint16_t InputSystem::HeldButtons() {
+   return buttons;
+ }
+ 
++uint16_t InputSystem::HeldButtons(uint32_t user_index) {
++  return user_index < g_held_buttons.size()
++      ? g_held_buttons[user_index].load(std::memory_order_relaxed) : 0;
++}
++
++uint32_t InputSystem::HeldLeftStick(uint32_t user_index) {
++  return user_index < g_held_left_stick.size() ? g_held_left_stick[user_index].load() : 0;
++}
++
++void InputSystem::ConfigureNativeRosterChord(uint16_t modifier, uint16_t trigger) {
++  g_roster_input.Configure(modifier, trigger);
++}
++
++int InputSystem::ConsumeNativeRosterOpenRequest(uint64_t* ticket) {
++  return g_roster_input.Consume(ticket);
++}
++
++bool InputSystem::RequestNativeRosterOpen(uint32_t user_index) {
++  return g_roster_input.Open(user_index, g_roster_input.LegacyBlocked());
++}
++
++bool InputSystem::ReleaseNativeRosterInput(uint64_t ticket) {
++  return g_roster_input.Close(ticket);
++}
++
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
++  return GetStateInternal(user_index, out_state, true);
++}
++
++X_RESULT InputSystem::GetStateInternal(uint32_t user_index, X_INPUT_STATE* out_state,
++                                     bool consume_state_replay) {
++  std::lock_guard<std::recursive_mutex> guard(g_roster_poll_mutex);
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
++    if (user_index < g_held_buttons.size()) g_held_buttons[user_index].store(0);
++    if (user_index < g_held_left_stick.size()) {
++      g_held_left_stick[user_index].store(0);
++      g_guest_packet_valid[user_index] = false;
++    }
++    const auto sample = g_roster_input.Observe(user_index, 0, false, g_roster_input.LegacyBlocked());
++    g_roster_keys.Feed(user_index, sample, NativeRosterInputLatch::Now(),
++                       g_roster_input.DrainStamp(user_index));
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
+@@ -280,16 +335,49 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+     g_held_buttons[user_index].store(any ? uint16_t(merged.gamepad.buttons) : 0,
+                                      std::memory_order_relaxed);
+   }
++  if (user_index < g_held_left_stick.size()) {
++    const uint32_t axes = uint16_t(int16_t(merged.gamepad.thumb_lx)) |
++        (uint32_t(uint16_t(int16_t(merged.gamepad.thumb_ly))) << 16);
++    g_held_left_stick[user_index].store(any ? axes : 0);
++  }
++  const bool analog_neutral = std::abs(int(int16_t(merged.gamepad.thumb_lx))) <= 7849 &&
++      std::abs(int(int16_t(merged.gamepad.thumb_ly))) <= 7849 &&
++      std::abs(int(int16_t(merged.gamepad.thumb_rx))) <= 8689 &&
++      std::abs(int(int16_t(merged.gamepad.thumb_ry))) <= 8689 &&
++      merged.gamepad.left_trigger <= 30 && merged.gamepad.right_trigger <= 30;
++  const auto roster_sample = g_roster_input.Observe(
++      user_index, any ? uint16_t(merged.gamepad.buttons) : 0, any,
++      g_roster_input.LegacyBlocked(), NativeRosterInputLatch::Now(),
++      consume_state_replay, analog_neutral);
++  auto key_sample = roster_sample;
++  key_sample.blocked = key_sample.blocked || g_roster_input.LegacyBlocked() || g_roster_input.Blocked(user_index);
++  if (g_roster_input.ReservedButtons() != NativeRosterBumperKeys::kMask) {
++    key_sample.committed_buttons = key_sample.committed_tap = 0;
++  }
++  g_roster_keys.Feed(user_index, key_sample, NativeRosterInputLatch::Now(),
++                     g_roster_input.DrainStamp(user_index));
++  merged.gamepad.buttons = roster_sample.guest_buttons;
+   if (!any) {
++    if (user_index < g_guest_packet_valid.size()) g_guest_packet_valid[user_index] = false;
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+-  if (g_guest_input_blocked.load(std::memory_order_relaxed)) {
++  if (roster_sample.blocked || g_roster_input.LegacyBlocked() || g_roster_input.Blocked(user_index)) {
+     // Connected but idle; the packet number still moves so nothing thinks the
+     // pad was unplugged.
+     const uint32_t packet = merged.packet_number;
+     merged = {};
+     merged.packet_number = packet;
+   }
++  if (consume_state_replay && user_index < g_guest_gamepad.size() &&
++      (g_roster_input.ReservedButtons() || roster_sample.blocked)) {
++    if (!g_guest_packet_valid[user_index] ||
++        std::memcmp(&g_guest_gamepad[user_index], &merged.gamepad, sizeof(merged.gamepad))) {
++      ++g_guest_packet[user_index];
++      g_guest_gamepad[user_index] = merged.gamepad;
++      g_guest_packet_valid[user_index] = true;
++    }
++    merged.packet_number = g_guest_packet[user_index];
++  }
+   if (out_state) {
+     *out_state = merged;
+   }
+@@ -340,33 +428,76 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard<std::recursive_mutex> guard(g_roster_poll_mutex);
++  X_INPUT_STATE sampled{};
++  const auto state_result = GetStateInternal(user_index, &sampled, false);
++  NativeRosterBumperKeys::Event synthetic{};
++  if (g_roster_keys.Pop(user_index, &synthetic, g_roster_input.DrainStamp(user_index),
++                       g_roster_input.LegacyBlocked() || g_roster_input.Blocked(user_index))) {
++    if (out_keystroke) {
++      *out_keystroke = {};
++      out_keystroke->virtual_key = synthetic.virtual_key;
++      out_keystroke->flags = synthetic.flags;
++      out_keystroke->user_index = static_cast<uint8_t>(user_index);
++    }
++    return X_ERROR_SUCCESS;
++  }
+   if (!assignment_) {
++    if (user_index < g_held_buttons.size()) g_held_buttons[user_index].store(0);
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+-  if (g_guest_input_blocked.load(std::memory_order_relaxed)) {
+-    return X_ERROR_EMPTY;
+-  }
+-
+-  RefreshDevices();
+   std::vector<DeviceId> ids;
+   assignment_->DevicesForUser(user_index, ids);
++  if (ids.empty()) {
++    if (user_index < g_held_buttons.size()) g_held_buttons[user_index].store(0);
++  }
++
++  const uint64_t stamp = g_roster_input.DrainStamp(user_index);
++  const bool blocked = g_roster_input.LegacyBlocked() || g_roster_input.Blocked(user_index);
++  if (blocked || stamp) {
++    bool drained = true;
++    // Drain every assigned driver's queue, even while blocked. A bounded
++    // drain that hits the cap stays pending; no old events are forwarded.
++    for (DeviceId id : ids) {
++      auto* driver = DriverForDevice(id);
++      if (!driver) continue;
++      X_INPUT_KEYSTROKE discarded{};
++      const bool empty = DrainRosterKeyQueue([&] {
++        const auto result = driver->GetDeviceKeystroke(id, flags, &discarded);
++        if (result == X_ERROR_SUCCESS) return RosterQueuePoll::Event;
++        if (result == X_ERROR_EMPTY) return RosterQueuePoll::Empty;
++        if (result == X_ERROR_DEVICE_NOT_CONNECTED) return RosterQueuePoll::Disconnected;
++        return RosterQueuePoll::Error;
++      });
++      drained = empty && drained;
++    }
++    if (drained && !g_roster_input.LegacyBlocked()) {
++      g_roster_input.CompleteDrain(user_index, stamp);
++    }
++    return state_result == X_ERROR_DEVICE_NOT_CONNECTED ? state_result : X_ERROR_EMPTY;
++  }
+ 
+   bool any_connected = false;
+   for (DeviceId id : ids) {
+     auto* driver = DriverForDevice(id);
+-    if (!driver) {
+-      continue;
+-    }
+-    X_RESULT result = driver->GetDeviceKeystroke(id, flags, out_keystroke);
+-    if (result == X_ERROR_SUCCESS) {
+-      out_keystroke->user_index = static_cast<uint8_t>(user_index);
+-      return result;
+-    }
+-    if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
+-      any_connected = true;
++    if (!driver) continue;
++    // Bumper transitions are synthesized from the shared committed state.
++    // Raw delayed shoulder events must never leak a swallowed chord.
++    for (uint32_t skipped = 0; skipped < 64; ++skipped) {
++      X_INPUT_KEYSTROKE stroke{};
++      const auto result = driver->GetDeviceKeystroke(id, flags, &stroke);
++      if (result != X_ERROR_DEVICE_NOT_CONNECTED) any_connected = true;
++      if (result != X_ERROR_SUCCESS) break;
++      if (g_roster_input.LegacyBlocked() || g_roster_input.Blocked(user_index) ||
++          g_roster_input.DrainStamp(user_index)) return X_ERROR_EMPTY;
++      if (g_roster_input.ReservedButtons() == NativeRosterBumperKeys::kMask &&
++          g_roster_input.ReservedKey(uint16_t(stroke.virtual_key))) continue;
++      stroke.user_index = static_cast<uint8_t>(user_index);
++      if (out_keystroke) *out_keystroke = stroke;
++      return X_ERROR_SUCCESS;
+     }
+   }
+-  return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
++  return any_connected || state_result == X_ERROR_SUCCESS ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+ }
+ 
+ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
+@@ -399,7 +530,7 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
+     // a loopback listener thread, which codegen has no use for.
+     if (REXCVAR_GET(toypad_emulation)) {
+       REXLOG_INFO("Portal: using the emulated ToyPad.");
+-      input->SetPortal(std::make_unique<EmulatedToypad>());
++      input->SetPortal(std::make_unique<EmulatedToypad>(REXCVAR_GET(toypad_companion_services)));
+     } else {
+       REXLOG_INFO("Portal: using a physical portal over USB.");
+       input->SetPortal(std::make_unique<HardwarePortal>());
+diff --git a/src/input/portal/emulated_toypad.cpp b/src/input/portal/emulated_toypad.cpp
+index 91199ea93140690ed1ea6e3eb377964e3363fd82..9b977b2fa687ad2871f214c1917f1a4dacf2d85f 100644
+--- a/src/input/portal/emulated_toypad.cpp
++++ b/src/input/portal/emulated_toypad.cpp
+@@ -30,11 +30,15 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <ctime>
++#include <random>
+ #include <fstream>
++#include <filesystem>
++#include <cerrno>
+ 
+ #include <rex/logging.h>
+ 
+ #ifndef _WIN32
++#include <fcntl.h>
+ #include <netinet/in.h>
+ #include <sys/socket.h>
+ #include <unistd.h>
+@@ -55,6 +59,11 @@ void CloseSock(socket_t s) { ::close(s); }
+ #endif
+ 
+ constexpr auto kMovePickupDelay = std::chrono::milliseconds(500);
++uint64_t ToypadNowMs() {
++  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
++      std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
+ 
+ // How long a connection may sit silent before the listener drops it. The
+ // companion app polls the pad colours several times a second and reconnects
+@@ -164,19 +173,77 @@ uint16_t ListenerPort() {
+ 
+ }  // namespace
+ 
+-void ToypadFigure::Save() {
+-  if (file_path.empty()) {
+-    return;
+-  }
+-  std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+-  if (!out) {
+-    REXLOG_WARN("Toypad: could not save figure to {}", file_path);
+-    return;
++bool ToypadFigure::Save() {
++  const bool saved = [this]() -> bool {
++  if (file_path.empty()) return true;  // Legacy in-memory figures.
++  // Replace only after the entire new image is durable. Never truncate the
++  // previous save. Exclusively create a sibling so rename stays on one volume.
++  static std::atomic<uint64_t> sequence{0};
++  try {
++    // Follow an existing tag symlink, rather than replacing the symlink itself.
++    const auto target = std::filesystem::weakly_canonical(std::filesystem::path(file_path));
++    for (unsigned attempt = 0; attempt < 64; ++attempt) {
++      auto temporary = target;
++#ifdef _WIN32
++      const auto process = static_cast<uint64_t>(::GetCurrentProcessId());
++#else
++      const auto process = static_cast<uint64_t>(::getpid());
++#endif
++      temporary += ".save-" + std::to_string(process) + "-" +
++                   std::to_string(sequence.fetch_add(1)) + ".tmp";
++#ifdef _WIN32
++      HANDLE file = ::CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
++                                 CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
++      if (file == INVALID_HANDLE_VALUE) {
++        const DWORD error = ::GetLastError();
++        if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) continue;
++        return false;
++      }
++      DWORD written = 0;
++      bool ok = ::WriteFile(file, data.data(), static_cast<DWORD>(data.size()),
++                            &written, nullptr) && written == data.size();
++      if (ok) ok = ::FlushFileBuffers(file) != FALSE;
++      if (!::CloseHandle(file)) ok = false;
++      if (ok) ok = ::MoveFileExW(temporary.c_str(), target.c_str(),
++                                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
++      if (!ok) ::DeleteFileW(temporary.c_str());  // Only our CREATE_NEW file.
++#else
++      const int file = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
++      if (file < 0) {
++        if (errno == EEXIST) continue;
++        return false;
++      }
++      size_t offset = 0;
++      bool ok = true;
++      while (offset < data.size()) {
++        const auto written = ::write(file, data.data() + offset, data.size() - offset);
++        if (written < 0 && errno == EINTR) continue;
++        if (written <= 0) { ok = false; break; }
++        offset += static_cast<size_t>(written);
++      }
++      if (ok) {
++        int result;
++        do { result = ::fsync(file); } while (result < 0 && errno == EINTR);
++        ok = result == 0;
++      }
++      // Do not retry close on EINTR: the descriptor may already be released.
++      if (::close(file) != 0) ok = false;
++      if (ok) ok = ::rename(temporary.c_str(), target.c_str()) == 0;
++      if (!ok) ::unlink(temporary.c_str());  // Only our O_EXCL file.
++#endif
++      return ok;
++    }
++  } catch (...) {
++    // Path/allocation failures happen before a temporary file is opened.
++    // Keep Save non-throwing because legacy callers may hold state_lock_.
+   }
+-  out.write(reinterpret_cast<const char*>(data.data()), data.size());
++  return false;
++  }();
++  persistence_failed = !saved;
++  return saved;
+ }
+ 
+-EmulatedToypad::EmulatedToypad() : Portal() {
++EmulatedToypad::EmulatedToypad(bool start_companion_services) : Portal(), native_only_(!start_companion_services) {
+   std::srand(static_cast<unsigned>(std::time(nullptr)));
+ 
+ #ifdef _WIN32
+@@ -184,11 +251,13 @@ EmulatedToypad::EmulatedToypad() : Portal() {
+   WSAStartup(MAKEWORD(2, 2), &wsa_data);  // ref-counted, safe if already done
+ #endif
+ 
+-  listener_running_.store(true);
+-  listener_thread_ = std::thread(&EmulatedToypad::ListenerRun, this, ListenerPort());
++  if (start_companion_services) {
++    listener_running_.store(true);
++    listener_thread_ = std::thread(&EmulatedToypad::ListenerRun, this, ListenerPort());
+ #ifdef _WIN32
+-  picker_thread_ = std::thread(&EmulatedToypad::PickerWatchRun, this);
++    picker_thread_ = std::thread(&EmulatedToypad::PickerWatchRun, this);
+ #endif
++  }
+   REXLOG_INFO("Toypad: emulated LEGO Dimensions ToyPad active");
+ }
+ 
+@@ -205,6 +274,13 @@ EmulatedToypad::~EmulatedToypad() {
+   if (picker_thread_.joinable()) {
+     picker_thread_.join();
+   }
++  if (native_only_) {
++    std::lock_guard lock(state_lock_);
++    for (auto& figure : figures_) {
++      if (figure.index != 255 && figure.persistence_failed && !figure.Save())
++        REXLOG_ERROR("Toypad: unsaved tag changes remain for {}", figure.file_path);
++    }
++  }
+ #ifdef _WIN32
+   WSACleanup();
+ #endif
+@@ -212,6 +288,34 @@ EmulatedToypad::~EmulatedToypad() {
+ 
+ bool EmulatedToypad::IsPickerInputActive() { return s_picker_active.load(); }
+ 
++bool EmulatedToypad::TryGetPadLightColors(std::array<ToypadRgb, 3>& colors) {
++  std::unique_lock lock(state_lock_, std::try_to_lock);
++  if (!lock.owns_lock()) return false;
++  const auto now = ToypadNowMs();
++  for (size_t i = 0; i < colors.size(); ++i) colors[i] = EvaluateToypadLight(pad_leds_[i], now);
++  return true;
++}
++
++
++bool EmulatedToypad::TryGetFigureStatus(std::array<FigureStatus, 7>& status) {
++  std::unique_lock lock(state_lock_, std::try_to_lock);
++  if (!lock.owns_lock()) return false;
++  for (size_t i = 0; i < status.size(); ++i) {
++    const auto& f = figures_[i];
++    status[i] = {f.id, f.index != 255, f.lifted, f.persistence_failed};
++  }
++  return true;
++}
++
++std::array<bool, kToypadFigureCount> EmulatedToypad::GetOccupancy() {
++  std::lock_guard<std::mutex> guard(state_lock_);
++  std::array<bool, kToypadFigureCount> occupied{};
++  for (size_t i = 0; i < occupied.size(); ++i) {
++    occupied[i] = figures_[i].index != 255;
++  }
++  return occupied;
++}
++
+ // ============================================================================
+ // Guest-facing read/write (XamInputNonControllerGetRawEx/SetRawEx)
+ // ============================================================================
+@@ -286,12 +390,32 @@ X_STATUS EmulatedToypad::WriteInternal(std::span<uint8_t> data) {
+ }
+ 
+ void EmulatedToypad::HandleCommand(const uint8_t* buf, size_t buf_size) {
+-  if (buf_size < 6) {
++  if (buf_size < 5 || buf[0] != 0x55 || buf[1] < 2 || size_t(buf[1]) + 3 > buf_size) {
+     return;
+   }
+ 
+   const uint8_t command = buf[2];
+   const uint8_t sequence = buf[3];
++  // Validate the declared payload, not padded USB transport bytes, before
++  // any command handler reads its arguments. Length includes command+sequence.
++  size_t minimum_payload = 2;
++  switch (command) {
++    case 0xB1: case 0xB3: case 0xD4: minimum_payload = 10; break;
++    case 0xC0: minimum_payload = 6; break;
++    case 0xC1: minimum_payload = 3; break;
++    case 0xC4: minimum_payload = 5; break;
++    case 0xC2: minimum_payload = 8; break;
++    case 0xC3: minimum_payload = 9; break;
++    case 0xC8: minimum_payload = 14; break;
++    case 0xC6: minimum_payload = 20; break;
++    case 0xC7: minimum_payload = 23; break;
++    case 0xD2: minimum_payload = 4; break;
++    case 0xD3: minimum_payload = 8; break;
++  }
++  if (buf[1] < minimum_payload) {
++    REXLOG_WARN("Toypad: truncated command {:02X}", command);
++    return;
++  }
+ 
+   std::array<uint8_t, 32> result{};
+ 
+@@ -336,9 +460,9 @@ void EmulatedToypad::HandleCommand(const uint8_t* buf, size_t buf_size) {
+     case 0xC8: {  // Color All: 3 x (enabled, R, G, B)
+       for (uint8_t pad = 1; pad <= kLedRegionCount; ++pad) {
+         const uint8_t* group = &buf[4] + (pad - 1) * 4;
+-        if (group[0]) {
+-          RecordPadLed(pad, static_cast<uint8_t>(ToypadLedMode::Solid), &group[1], 0, 0, 0, 0);
+-        }
++        const uint8_t off[] = {0, 0, 0};
++        RecordPadLed(pad, static_cast<uint8_t>(ToypadLedMode::Solid), group[0] ? &group[1] : off,
++                     0, 0, 0, 0);
+       }
+       GetBlankResponse(0x01, sequence, result);
+       break;
+@@ -365,11 +489,42 @@ void EmulatedToypad::HandleCommand(const uint8_t* buf, size_t buf_size) {
+       GetBlankResponse(0x01, sequence, result);
+       break;
+     }
+-    case 0xC1:    // Get Pad Color
+-    case 0xC4: {  // Fade Random
++    case 0xC1: {  // Get evaluated colour. Same 1-based pad contract as C0/C2/C3.
++      result[0] = 0x55; result[1] = 4; result[2] = sequence;
++      {
++        std::lock_guard guard(state_lock_);
++        if (buf[4] >= 1 && buf[4] <= 3) {
++          const auto rgb = EvaluateToypadLight(pad_leds_[buf[4]-1], ToypadNowMs());
++          std::copy(rgb.begin(), rgb.end(), result.begin()+3);
++        }
++      }
++      result[6] = GenerateChecksum(result, 6);
++      break;
++    }
++    case 0xC4: {  // Random target, normal alternating fade; independent of auth RNG.
++      static thread_local std::mt19937 lights_rng(std::random_device{}());
++      const uint32_t random = lights_rng();
++      const uint8_t rgb[] = {static_cast<uint8_t>(random), static_cast<uint8_t>(random >> 8),
++                             static_cast<uint8_t>(random >> 16)};
++      RecordPadLed(buf[4], static_cast<uint8_t>(ToypadLedMode::Fade), rgb, 0, 0, buf[6], buf[5]);
+       GetBlankResponse(0x01, sequence, result);
+       break;
+     }
++    case 0xD0: {  // List guest-present tags, keeping the same indices as our events.
++      result[0] = 0x55; result[2] = sequence;
++      size_t out = 3;
++      {
++        std::lock_guard guard(state_lock_);
++        for (const auto& figure : figures_) {
++          if (figure.index == 255 || figure.lifted) continue;
++          result[out++] = static_cast<uint8_t>((figure.pad << 4) | figure.index);
++          result[out++] = 0;
++        }
++      }
++      result[1] = static_cast<uint8_t>(out - 2);
++      result[out] = GenerateChecksum(result, static_cast<uint32_t>(out));
++      break;
++    }
+     case 0xD2: {  // Read
+       QueryBlock(buf[4], buf[5], result, sequence);
+       break;
+@@ -421,9 +576,15 @@ void EmulatedToypad::RecordPadLed(uint8_t pad, uint8_t mode, const uint8_t* rgb,
+       next.g = rgb[1];
+       next.b = rgb[2];
+       // The colour standing on the pad when this command landed.
+-      next.from_r = pad_leds_[i].r;
+-      next.from_g = pad_leds_[i].g;
+-      next.from_b = pad_leds_[i].b;
++      const auto now = ToypadNowMs();
++      const auto displayed = EvaluateToypadLight(pad_leds_[i], now);
++      next.from_r = displayed[0];
++      next.from_g = displayed[1];
++      next.from_b = displayed[2];
++      next.started_ms = now;
++      next.revision = pad_leds_[i].revision + 1;
++      next.base = mode == static_cast<uint8_t>(ToypadLedMode::Flash)
++                    ? displayed : ToypadRgb{rgb[0], rgb[1], rgb[2]};
+       next.on_ticks = on_ticks;
+       next.off_ticks = off_ticks;
+       next.count = count;
+@@ -671,7 +832,7 @@ void EmulatedToypad::QueryBlock(uint8_t index, uint8_t page, std::array<uint8_t,
+   // Index from game begins at 1 rather than 0.
+   if (const uint8_t figure_index = index - 1; figure_index < kToypadFigureCount) {
+     const ToypadFigure& figure = figures_[figure_index];
+-    if (figure.index != 255 && (4 * page) < (kToypadTagSize - 16)) {
++    if (figure.index != 255 && !figure.lifted && (4 * page) <= (kToypadTagSize - 16)) {
+       std::memcpy(&reply_buf[4], figure.data.data() + (4 * page), 16);
+     }
+   }
+@@ -689,13 +850,15 @@ void EmulatedToypad::WriteBlock(uint8_t index, uint8_t page, const uint8_t* to_w
+ 
+   if (const uint8_t figure_index = index - 1; figure_index < kToypadFigureCount) {
+     ToypadFigure& figure = figures_[figure_index];
+-    if (figure.index != 255 && page < 0x2D) {
++    if (figure.index != 255 && !figure.lifted && page < 0x2D) {
+       // Id is written to page 36.
+       if (page == 36) {
+         figure.id = ReadLE32(to_write_buf);
+       }
+       std::memcpy(figure.data.data() + (page * 4), to_write_buf, 4);
+-      figure.Save();
++      if (!figure.Save()) {
++        REXLOG_WARN("Toypad: save failed for {}; retaining live data", figure.file_path);
++      }
+     }
+   }
+   reply_buf[4] = GenerateChecksum(reply_buf, 4);
+@@ -710,7 +873,7 @@ void EmulatedToypad::GetModel(const uint8_t* buf, uint8_t sequence,
+   if (const uint8_t figure_index = index - 1; figure_index < kToypadFigureCount) {
+     std::lock_guard<std::mutex> guard(state_lock_);
+     const ToypadFigure& figure = figures_[figure_index];
+-    WriteLE32(value_to_encrypt.data(), figure.id);
++    WriteLE32(value_to_encrypt.data(), figure.index != 255 && !figure.lifted ? figure.id : 0);
+   }
+   WriteBE32(value_to_encrypt.data() + 4, conf);
+   const std::array<uint8_t, 8> encrypted = Encrypt(value_to_encrypt.data(), std::nullopt);
+@@ -739,6 +902,8 @@ uint32_t EmulatedToypad::LoadFigure(const std::array<uint8_t, kToypadTagSize>& b
+   figure.id = id;
+   figure.pad = pad;
+   figure.index = index + 1;
++  figure.lifted = false;
++  figure.persistence_failed = false;
+   std::memcpy(figure.data.data(), buf.data(), buf.size());
+ 
+   // Notify the game: pad, index, direction (0x00 = added) and UID.
+@@ -756,45 +921,64 @@ uint32_t EmulatedToypad::LoadFigure(const std::array<uint8_t, kToypadTagSize>& b
+ }
+ 
+ bool EmulatedToypad::RemoveFigure(uint8_t pad, uint8_t index, bool full_remove, bool lock) {
++  std::unique_lock<std::mutex> guard(state_lock_, std::defer_lock);
++  if (lock) guard.lock();
+   ToypadFigure& figure = GetFigureByIndex(index);
+   if (figure.index == 255) {
+     return false;
+   }
+ 
+-  if (lock) {
+-    state_lock_.lock();
+-  }
+ 
+   // Notify the game: pad, index, direction (0x01 = removed) and UID.
+   if (full_remove) {
++    // Failure must retain ownership, bytes and path, with no remove event.
++    if (!figure.Save()) {
++      REXLOG_WARN("Toypad: could not save figure to {}; removal cancelled", figure.file_path);
++      return false;
++    }
+     std::array<uint8_t, 32> figure_change_response = {
+         0x56,           0x0b,           pad,            0x00,           figure.index,
+         0x01,           figure.data[0], figure.data[1], figure.data[2], figure.data[4],
+         figure.data[5], figure.data[6], figure.data[7]};
+     figure_change_response[13] = GenerateChecksum(figure_change_response, 13);
+-    responses_.push(figure_change_response);
+-    figure.Save();
++    if (!figure.lifted) responses_.push(figure_change_response);
+     figure.file_path.clear();
+   }
+ 
+   figure.index = 255;
+   figure.pad = 255;
+   figure.id = 0;
++  figure.lifted = false;
++  figure.persistence_failed = false;
+ 
+-  if (lock) {
+-    state_lock_.unlock();
+-  }
++  return true;
++}
++
++bool EmulatedToypad::RemoveFigureNative(uint8_t pad, uint8_t index,
++    const std::array<uint8_t, 7>& uid, std::array<uint8_t, kToypadTagSize>& saved) {
++  std::lock_guard guard(state_lock_);
++  if (index >= figures_.size()) return false;
++  const auto& figure = figures_[index];
++  const std::array<uint8_t, 7> actual{figure.data[0],figure.data[1],figure.data[2],
++      figure.data[4],figure.data[5],figure.data[6],figure.data[7]};
++  if (!native_only_ || figure.index == 255 || figure.pad != pad || actual != uid) return false;
++  const auto live = figure.data;
++  if (!RemoveFigure(pad, index, true, false)) return false;
++  saved = live;
+   return true;
+ }
+ 
+ bool EmulatedToypad::TempRemove(uint8_t index) {
+   std::lock_guard<std::mutex> guard(state_lock_);
+ 
+-  const ToypadFigure& figure = GetFigureByIndex(index);
++  ToypadFigure& figure = GetFigureByIndex(index);
+   if (figure.index == 255) {
+     return false;
+   }
+ 
++  if (figure.lifted) return true; // Pickup is idempotent.
++  figure.lifted = true;
++
+   // Report the figure as "picked up" until the move completes or cancels.
+   std::array<uint8_t, 32> figure_change_response = {
+       0x56,           0x0b,           figure.pad,     0x00,           figure.index,
+@@ -813,6 +997,8 @@ bool EmulatedToypad::CancelRemove(uint8_t index) {
+     return false;
+   }
+ 
++  if (!figure.lifted) return true; // Restore is idempotent.
++  figure.lifted = false;
+   std::array<uint8_t, 32> figure_change_response = {
+       0x56,           0x0b,           figure.pad,     0x00,           figure.index,
+       0x00,           figure.data[0], figure.data[1], figure.data[2], figure.data[4],
+@@ -825,21 +1011,24 @@ bool EmulatedToypad::CancelRemove(uint8_t index) {
+ bool EmulatedToypad::MoveFigure(uint8_t pad, uint8_t index, uint8_t old_pad, uint8_t old_index) {
+   if (old_index == index) {
+     // Don't bother removing and loading again, just answer the game.
+-    CancelRemove(index);
+-    return true;
++    return CancelRemove(index);
+   }
+ 
+   std::lock_guard<std::mutex> guard(state_lock_);
+ 
+   // Clear the destination, remove from the source, load into destination.
+-  RemoveFigure(pad, index, true, false);
++  if (GetFigureByIndex(old_index).index == 255) return false;
++  if (GetFigureByIndex(index).index != 255 &&
++      !RemoveFigure(pad, index, true, false)) return false;
+ 
+   ToypadFigure& figure = GetFigureByIndex(old_index);
++  const bool save_failed = figure.persistence_failed;
+   const std::array<uint8_t, kToypadTagSize> data = figure.data;
+   std::string file_path = std::move(figure.file_path);
+ 
+   RemoveFigure(old_pad, old_index, false, false);
+   LoadFigure(data, std::move(file_path), pad, index, false);
++  GetFigureByIndex(index).persistence_failed = save_failed;
+   return true;
+ }
+ 
+@@ -925,8 +1114,14 @@ bool EmulatedToypad::HandleCommand(uintptr_t client_socket) {
+ 
+       // The listener contract is that LOAD silently overwrites an occupied
+       // slot.
+-      RemoveFigure(pad, index, true, true);
+-      LoadFigure(tag, std::move(path), pad, index, true);
++      {
++        std::lock_guard<std::mutex> guard(state_lock_);
++        if (GetFigureByIndex(index).index != 255 && !RemoveFigure(pad, index, true, false)) {
++          REXLOG_WARN("Toypad listener: LOAD cancelled; existing tag could not be saved");
++          return false;
++        }
++        LoadFigure(tag, std::move(path), pad, index, false);
++      }
+       REXLOG_INFO("Toypad listener: LOAD -> pad={} index={} (path len {})", pad, index, path_len);
+       break;
+     }
+@@ -950,7 +1145,11 @@ bool EmulatedToypad::HandleCommand(uintptr_t client_socket) {
+       }
+ 
+       std::this_thread::sleep_for(kMovePickupDelay);
+-      MoveFigure(pad, index, old_pad, old_index);
++      if (!MoveFigure(pad, index, old_pad, old_index)) {
++        CancelRemove(old_index);
++        REXLOG_WARN("Toypad listener: MOVE cancelled; original position restored");
++        return false;
++      }
+       REXLOG_INFO("Toypad listener: MOVE {}/{} -> {}/{}", old_pad, old_index, pad, index);
+       break;
+     }
+diff --git a/tests/native_roster_bumper_keys_test.cpp b/tests/native_roster_bumper_keys_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..794651739b5f492abb2e73b43ea05c46639804a5
+--- /dev/null
++++ b/tests/native_roster_bumper_keys_test.cpp
+@@ -0,0 +1,56 @@
++#include <rex/input/native_roster_bumper_keys.h>
++#include <cassert>
++#include <iostream>
++using L=rex::input::NativeRosterInputLatch;
++using K=rex::input::NativeRosterBumperKeys;
++using E=K::Event;
++L::Sample sample(uint16_t held=0,uint16_t tap=0,bool blocked=false) { return {held,blocked,held,tap}; }
++void expect(K& k,unsigned user,uint16_t key,uint16_t flags,uint64_t stamp=0,bool blocked=false) {
++  E e{}; assert(k.Pop(user,&e,stamp,blocked)); assert(e.virtual_key==key && e.flags==flags);
++}
++void empty(K& k,unsigned user=0) { E e{}; assert(!k.Pop(user,&e)); }
++int main() {
++  { K k; k.Feed(0,sample(K::kLB),0); expect(k,0,0x5805,K::kDown);
++    k.Feed(0,sample(K::kLB),399); empty(k);
++    k.Feed(0,sample(K::kLB),400); expect(k,0,0x5805,K::kDown|K::kRepeat);
++    k.Feed(0,sample(K::kLB),479); empty(k);
++    k.Feed(0,sample(K::kLB),480); expect(k,0,0x5805,K::kDown|K::kRepeat);
++    k.Feed(0,sample(),481); expect(k,0,0x5805,K::kUp); empty(k);
++  }
++  // Every sampled short tap survives even when GetState replay coalesces.
++  { K k; for(unsigned i=0;i<10;++i) k.Feed(1,sample(0,K::kRB),i);
++    for(unsigned i=0;i<10;++i) { expect(k,1,0x5804,K::kDown); expect(k,1,0x5804,K::kUp); }
++    empty(k,1); empty(k,0);
++  }
++  // Modal reset before delivery discards undelivered down/up completely.
++  { K k; k.Feed(0,sample(0,K::kLB),0); k.Feed(0,sample(0,0,true),1,17);
++    E e{}; assert(!k.Pop(0,&e,17,true)); }
++  // Modal reset after down balances ONLY that delivered down. Fresh blocked
++  // delivery checks protect events queued just before a modal opened.
++  { K k; k.Feed(0,sample(K::kLB),0); expect(k,0,0x5805,K::kDown);
++    k.Feed(0,sample(K::kLB|K::kRB),1);
++    expect(k,0,0x5805,K::kUp,42,true); E e{}; assert(!k.Pop(0,&e,42,true));
++    k.Feed(0,sample(),2,42); assert(!k.Pop(0,&e,42,true));
++    k.Feed(0,sample(),3); empty(k);
++  }
++  // Overflow drops pending unobserved keys and balances delivered keys;
++  // held input cannot spontaneously restart until neutral.
++  { K k; k.Feed(0,sample(K::kLB),0); expect(k,0,0x5805,K::kDown);
++    for(unsigned i=0;i<100;++i) k.Feed(0,sample(K::kLB, K::kRB),i);
++    assert(k.Overflowed(0)); expect(k,0,0x5805,K::kUp); empty(k);
++    k.Feed(0,sample(K::kLB),1000); empty(k); assert(k.Overflowed(0));
++    k.Feed(0,sample(),1001); assert(!k.Overflowed(0));
++    k.Feed(0,sample(K::kLB),1002); expect(k,0,0x5805,K::kDown);
++  }
++  // Both polling paths feed ONE queue; key-only polls preserve state replay.
++  { L l; K k; l.Configure(K::kLB,K::kRB);
++    auto observe=[&](uint16_t raw,uint64_t now,bool state){ auto s=l.Observe(0,raw,true,false,now,state); k.Feed(0,s,now); return s; };
++    observe(0,0,true); observe(K::kLB,1,true); empty(k);
++    observe(0,2,false); expect(k,0,0x5805,K::kDown); expect(k,0,0x5805,K::kUp);
++    assert(observe(0,3,true).guest_buttons==K::kLB); empty(k);
++    assert(observe(0,4,true).guest_buttons==0); empty(k);
++    observe(K::kLB,5,false); auto chord=observe(K::kLB|K::kRB,6,false);
++    assert(chord.blocked); empty(k);
++  }
++  std::cout << "PASS: bounded bumper key bridge, ordered taps, repeats, modal balancing and overflow\n";
++}
+diff --git a/tests/native_roster_input_latch_test.cpp b/tests/native_roster_input_latch_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e809eee1b3e8af810bceb400e9aef4a001f7bf5b
+--- /dev/null
++++ b/tests/native_roster_input_latch_test.cpp
+@@ -0,0 +1,116 @@
++#include <rex/input/native_roster_input_latch.h>
++#include <cassert>
++#include <deque>
++#include <iostream>
++using rex::input::NativeRosterInputLatch;
++using rex::input::DrainRosterKeyQueue;
++using rex::input::RosterQueuePoll;
++constexpr uint16_t LB=0x100, RB=0x200, Back=0x20, R3=0x80, A=0x1000;
++using L = NativeRosterInputLatch;
++void arm(L& l) { l.Configure(LB,RB); for (unsigned i=0;i<4;++i) l.Observe(i,0,true,false,0); }
++int main() {
++  // Startup/rebinding while held passes through until a neutral observation.
++  { L l; l.Configure(LB,RB);
++    assert(l.Observe(0,LB|RB,true,false,0).blocked);
++    assert(l.Observe(0,LB|RB,true,false,0).guest_buttons==(LB|RB));
++    assert(!l.Active()); l.Observe(0,0,true,false,1);
++    assert(l.Observe(0,LB|RB,true,false,2).blocked);
++  }
++  for (auto first : {LB,RB}) {
++    const uint16_t second = (LB|RB)^first;
++    L l; arm(l);
++    assert(l.Observe(0, first|A,true,false,10).guest_buttons == A);
++    assert(l.Observe(0, first,true,false,89).guest_buttons == 0);
++    assert(l.Observe(0, first,true,false,90).guest_buttons == first);
++    assert(l.Observe(0, first|second,true,false,91).guest_buttons == (LB|RB));
++    assert(!l.Active()); // second arrival after expiry never steals first
++    assert(l.Observe(0, second,true,false,92).guest_buttons == second);
++    assert(l.Observe(0, first|second,true,false,93).guest_buttons == (LB|RB));
++    assert(!l.Active()); // re-press while other held cannot rearm
++    l.Observe(0,0,true,false,94);
++    assert(l.Observe(0,first|second,true,false,95).blocked);
++    uint64_t token=0; assert(l.Consume(&token)==0 && token);
++    assert(l.Close(token));
++  }
++  for (auto arrival : {79u,80u,81u}) {
++    L l; arm(l); l.Observe(0,LB,true,false,100);
++    auto s=l.Observe(0,LB|RB,true,false,100+arrival);
++    assert(l.Active()==(arrival<80));
++    assert(s.blocked==(arrival<80));
++    if (arrival>=80) assert(s.guest_buttons==(LB|RB));
++  }
++  // Early released taps replay down in one state call, then up. A key-only
++  // observation may advance arbitration but cannot consume that state pulse.
++  for (auto first : {LB,RB}) {
++    L l; arm(l); l.Observe(0,first,true,false,100,false);
++    auto tap=l.Observe(0,0,true,false,110,false);
++    assert(tap.committed_tap==first && tap.committed_buttons==0);
++    assert(l.Observe(0,0,true,false,111,false).committed_tap==0);
++    assert(l.Observe(0,0,true,false,112).guest_buttons==first);
++    assert(l.Observe(0,0,true,false,113).guest_buttons==0);
++  }
++  // Release first and press second in one snapshot cannot count as a chord.
++  { L l; arm(l); l.Observe(0,LB,true,false,0);
++    auto s=l.Observe(0,RB,true,false,1);
++    assert(s.guest_buttons==(LB|RB) && s.committed_tap==LB);
++    assert(!l.Active()); assert(l.Observe(0,RB,true,false,2).guest_buttons==RB);
++  }
++  // Fast double tap: force the release edge between synthetic tap and fresh press.
++  { L l; arm(l); assert(l.Observe(0,LB,true,false,0).guest_buttons==0);
++    assert(l.Observe(0,0,true,false,10).guest_buttons==LB);
++    assert(l.Observe(0,LB,true,false,20).guest_buttons==0);
++    assert(l.Observe(0,0,true,false,30).guest_buttons==LB);
++    assert(l.Observe(0,0,true,false,40).guest_buttons==0);
++  }
++  // Disconnected pending input is discarded; no phantom tap on reconnect.
++  { L l; arm(l); l.Observe(0,LB,true,false,1);
++    assert(!l.Observe(0,0,false,false,2).guest_buttons);
++    assert(!l.Observe(0,0,true,false,3).guest_buttons);
++  }
++  // Per-user independence and old Back/R3 passthrough.
++  { L l; arm(l);
++    assert(!l.ReservedKey(0x5815) && !l.ReservedKey(0x5817));
++    assert(l.ReservedKey(0x5804) && l.ReservedKey(0x5805));
++    assert(l.Observe(2,Back|R3,true,false,1).guest_buttons==(Back|R3));
++    l.Observe(0,LB,true,false,2); l.Observe(1,RB,true,false,2);
++    assert(!l.Active()); assert(l.Observe(0,LB,true,false,82).guest_buttons==LB);
++    assert(l.Observe(1,RB,true,false,82).guest_buttons==RB);
++  }
++  // Modal generations, queue epochs, all-user quarantine and analog neutrality.
++  { L l; arm(l); l.Observe(2,LB,true,false,1);
++    assert(l.Open(0,false)); l.Observe(0,0,true,false,1); uint64_t t=0; assert(l.Consume(&t)==0);
++    auto open=l.DrainStamp(1); assert(!l.CompleteDrain(1,open));
++    assert(l.Close(t)); assert(!l.Active());
++    assert(l.Observe(1,0,true,false,2,true,false).blocked);
++    assert(l.Blocked(1)); // buttons released, stick still held
++    assert(l.Observe(1,0,true,false,3,true,true).blocked);
++    assert(!l.Blocked(1)); assert(!l.CompleteDrain(1,open));
++    auto closed=l.DrainStamp(1); assert(closed!=open && l.CompleteDrain(1,closed));
++    assert(!l.Observe(1,A,true,false,4).blocked);
++    assert(l.Observe(2,LB,true,false,5).blocked);
++    assert(l.Observe(2,0,false,false,6,true,false).blocked);
++    assert(!l.Observe(2,0,true,false,7).guest_buttons); // pending singleton purged
++    assert(l.Open(2,false)); l.Observe(2,0,true,false,8); uint64_t t2=0; assert(l.Consume(&t2)==2);
++    assert(t2!=t && !l.Close(t) && l.Active());
++    l.Configure(0,0); assert(l.Active()); assert(l.Close(t2));
++  }
++  // Legacy overlay cancels a pending replay and forbids open.
++  { L l; arm(l); l.Observe(0,LB,true,false,1);
++    assert(l.Observe(0,LB|RB,true,true,2).blocked);
++    assert(!l.Active() && !l.Open(0,true));
++    assert(l.Observe(0,LB|RB,true,false,3).guest_buttons==(LB|RB));
++    assert(!l.Active()); l.Observe(0,0,true,false,4);
++    assert(l.Observe(0,LB|RB,true,false,5).blocked);
++  }
++  // Bounded drain does not acknowledge cap or driver errors as empty.
++  std::deque<int> q(130,1); auto poll=[&] {
++    if(q.empty()) return RosterQueuePoll::Empty;
++    q.pop_front(); return RosterQueuePoll::Event;
++  };
++  assert(!DrainRosterKeyQueue(poll) && q.size()==66);
++  assert(!DrainRosterKeyQueue(poll) && q.size()==2);
++  assert(DrainRosterKeyQueue(poll));
++  assert(!DrainRosterKeyQueue([]{return RosterQueuePoll::Error;}));
++  assert(DrainRosterKeyQueue([]{return RosterQueuePoll::Disconnected;}));
++  std::cout << "PASS: deterministic 80ms bumper arbitration, replay, generations, analog quarantine\n";
++}
+diff --git a/tests/native_roster_nonblocking_test.cpp b/tests/native_roster_nonblocking_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..675cb2a68ff643bc619beb58cfaf04ac41e49333
+--- /dev/null
++++ b/tests/native_roster_nonblocking_test.cpp
+@@ -0,0 +1,83 @@
++#define REX_NATIVE_ROSTER_TESTING
++#include <rex/input/native_roster_input_latch.h>
++#include <cassert>
++#include <future>
++#include <chrono>
++#include <atomic>
++#include <thread>
++#include <iostream>
++using L=rex::input::NativeRosterInputLatch;
++constexpr uint16_t LB=0x100,RB=0x200;
++void arm(L& l) { l.Configure(LB,RB); for(unsigned i=0;i<4;++i) l.Observe(i,0,true,false,0); }
++void acknowledge(L& l) { assert(l.Observe(0,0,true,false,1).blocked); }
++uint64_t consume(L& l) { uint64_t t=0;assert(l.Consume(&t)==0);assert(t);return t; }
++int main(){
++  // UI controls finish while a simulated guest mutation owner is suspended.
++  {L l;arm(l);std::promise<void> held,release;auto wait=release.get_future().share();
++   std::thread guest([&]{l.TestWithGuestMutationLock([&]{held.set_value();wait.wait();});});held.get_future().wait();
++   auto ui=std::async(std::launch::async,[&]{
++     l.Configure(RB,LB);l.SetLegacyBlocked(true);l.SetLegacyBlocked(false);
++     assert(l.Open(0,false));assert(l.Consume(nullptr)==-1);
++     l.Configure(0,0);assert(!l.Active());return true;
++   });
++   assert(ui.wait_for(std::chrono::seconds(1))==std::future_status::ready);assert(ui.get());
++   release.set_value();guest.join();
++  }
++  // Close of consumed ownership is equally nonblocking; stale tickets fail.
++  {L l;arm(l);assert(l.Open(0,false));acknowledge(l);auto t=consume(l);
++   std::promise<void> held,release;auto wait=release.get_future().share();
++   std::thread guest([&]{l.TestWithGuestMutationLock([&]{held.set_value();wait.wait();});});held.get_future().wait();
++   auto ui=std::async(std::launch::async,[&]{assert(l.Close(t));assert(!l.Close(t));return true;});
++   assert(ui.wait_for(std::chrono::seconds(1))==std::future_status::ready);assert(ui.get());release.set_value();guest.join();
++   assert(!l.Active() && l.Blocked(0));
++  }
++  // Keyboard request is not visible until suppression is observed.
++  {L l;arm(l);assert(l.Open(0,false));assert(l.Consume(nullptr)==-1);
++   acknowledge(l);auto t=consume(l);assert(l.Consume(nullptr)==-1);
++   l.Configure(0,0);assert(l.Active()); // consumed ownership survives disable
++   assert(l.Close(t));
++   auto close=l.DrainStamp(0);assert(close);assert(!l.CompleteDrain(0,close));
++   assert(l.Observe(0,0,true,false,2,true,false).blocked);assert(l.Blocked(0));
++   assert(l.Observe(0,0,true,false,3,true,true).blocked);assert(!l.Blocked(0));
++   assert(l.CompleteDrain(0,close));assert(!l.DrainStamp(0));
++  }
++  // Configure cancels both awaiting and ready (unconsumed), never old close/new owner.
++  {L l;arm(l);assert(l.Open(0,false));l.Configure(0,0);assert(!l.Active());assert(l.Consume(nullptr)==-1);
++   arm(l);assert(l.Open(0,false));acknowledge(l);l.Configure(0,0);assert(!l.Active());assert(l.Consume(nullptr)==-1);
++   arm(l);assert(l.Open(0,false));acknowledge(l);auto old=consume(l);assert(l.Close(old));
++   l.Observe(0,0,true,false,5);assert(l.Open(0,false));acknowledge(l);auto newer=consume(l);assert(newer!=old);
++   assert(!l.Close(old)&&l.Active());assert(l.Close(newer));
++  }
++  // Unobserved legacy true/false cancels old replay and creates real drain work.
++  {L l;arm(l);l.Observe(0,LB,true,false,1);l.Observe(0,0,true,false,2,false);
++   const auto before=l.DrainStamp(0);l.SetLegacyBlocked(true);l.SetLegacyBlocked(false);
++   auto reset=l.Observe(0,0,true,false,3);assert(reset.blocked&&reset.guest_buttons==0);
++   assert(l.DrainStamp(0)>before);assert(!l.CompleteDrain(0,before));
++   assert(l.Observe(0,0,true,false,4).guest_buttons==0);
++  }
++  // Binding change also cancels a pending singleton instead of replaying it.
++  {L l;arm(l);l.Observe(0,LB,true,false,1);l.Configure(0,0);l.Configure(LB,RB);
++   assert(l.Observe(0,0,true,false,2).blocked);assert(l.Observe(0,0,true,false,3).guest_buttons==0);
++  }
++  // Interrupted initializer resumes after cancel + newer ready request: its
++  // old drain publication cannot replace newer stamp or resurrect old pending.
++  {L l;arm(l);struct Pause {std::promise<void> held,release;std::shared_future<void> wait;std::atomic<int> n{0};} p;
++   p.wait=p.release.get_future().share();l.TestAfterValidatedClaim([](void* v){auto& p=*static_cast<Pause*>(v);if(p.n.fetch_add(1)==0){p.held.set_value();p.wait.wait();}},&p);
++   auto old=std::async(std::launch::async,[&]{return l.Open(0,false);});p.held.get_future().wait();
++   l.Configure(0,0);assert(!l.Active());l.Configure(LB,RB);
++   assert(l.Open(0,false));acknowledge(l);auto newer=consume(l);auto stamp=l.DrainStamp(0);
++   p.release.set_value();assert(!old.get());assert(l.Active());assert(l.DrainStamp(0)==stamp);assert(l.Consume(nullptr)==-1);assert(l.Close(newer));
++  }
++  // Disable between Consume CAS and UI publication must reject the old owner,
++  // even though Configure sees Consumed and intentionally preserves ownership.
++  {L l;arm(l);assert(l.Open(0,false));acknowledge(l);
++   struct Pause {std::promise<void> held,release;std::shared_future<void> wait;} p;
++   p.wait=p.release.get_future().share();l.TestAfterConsumeClaim([](void* v){auto& p=*static_cast<Pause*>(v);p.held.set_value();p.wait.wait();},&p);
++   auto taking=std::async(std::launch::async,[&]{uint64_t t=99;const int user=l.Consume(&t);assert(t==0);return user;});
++   p.held.get_future().wait();l.Configure(0,0);assert(l.Active());
++   p.release.set_value();assert(taking.get()==-1);assert(!l.Active());
++  }
++  // Chord publication stays immediate within its suppressing guest sample.
++  {L l;arm(l);l.Observe(0,LB,true,false,10);assert(l.Observe(0,LB|RB,true,false,89).blocked);auto t=consume(l);assert(l.Close(t));}
++  std::cout<<"PASS: nonblocking UI control plane, suppression barrier, epochs and stale publication\n";
++}

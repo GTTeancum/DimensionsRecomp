@@ -23,6 +23,9 @@ set(LEGODIMENSIONS_SOURCES
     src/ui_theme.cpp
     src/mod_menu.cpp
     src/main_menu_extras.cpp
+    src/native_roster.cpp
+    src/native_roster_sha256.cpp
+    src/native_roster_backend.cpp
     src/skip_cutscenes.cpp
     src/cheat_engine.cpp
     src/cheat_menu.cpp
