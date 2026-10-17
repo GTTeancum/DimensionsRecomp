@@ -1,0 +1,285 @@
+diff --git a/src/ui/d3d12/d3d12_upload_buffer_pool.cpp b/src/ui/d3d12/d3d12_upload_buffer_pool.cpp
+index ade5dd2..a87ae47 100644
+--- a/src/ui/d3d12/d3d12_upload_buffer_pool.cpp
++++ b/src/ui/d3d12/d3d12_upload_buffer_pool.cpp
+@@ -86,7 +86,7 @@ GraphicsUploadBufferPool::Page* D3D12UploadBufferPool::CreatePageImplementation(
+   void* mapping;
+   if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+     REXLOG_ERROR("Failed to map a D3D upload buffer with {} bytes", page_size_);
+-    buffer->Release();
++    // The local ComPtr releases the resource on return.
+     return nullptr;
+   }
+   // Unmapping will be done implicitly when the resource is destroyed.
+diff --git a/src/ui/graphics_upload_buffer_pool.cpp b/src/ui/graphics_upload_buffer_pool.cpp
+index 407498e..76a2932 100644
+--- a/src/ui/graphics_upload_buffer_pool.cpp
++++ b/src/ui/graphics_upload_buffer_pool.cpp
+@@ -48,7 +48,9 @@ void GraphicsUploadBufferPool::ChangeSubmissionTimeline() {
+   } else {
+     writable_first_ = submitted_first_;
+   }
+-  writable_last_ = submitted_last_;
++  if (submitted_last_) {
++    writable_last_ = submitted_last_;
++  }
+   submitted_first_ = nullptr;
+   submitted_last_ = nullptr;
+ 
+@@ -120,6 +122,11 @@ GraphicsUploadBufferPool::Page* GraphicsUploadBufferPool::Request(uint64_t submi
+         writable_last_ = nullptr;
+       }
+     }
++    // The previous page is closed. Reset its cursor even if allocating the
++    // replacement fails, so a retry or reclaimed page starts at offset zero.
++    current_page_used_ = 0;
++    current_page_used_aligned = 0;
++    current_page_flushed_ = 0;
+     if (!writable_first_) {
+       // Create a new page if none available.
+       writable_first_ = CreatePageImplementation();
+@@ -133,9 +140,6 @@ GraphicsUploadBufferPool::Page* GraphicsUploadBufferPool::Request(uint64_t submi
+       // After CreatePageImplementation (more specifically, the first successful
+       // call), page_size_ may grow - but this doesn't matter here.
+     }
+-    current_page_used_ = 0;
+-    current_page_used_aligned = 0;
+-    current_page_flushed_ = 0;
+   }
+   writable_first_->last_submission_index_ = submission_index;
+   offset_out = current_page_used_aligned;
+diff --git a/tests/regression/upload_buffer_pool/README.md b/tests/regression/upload_buffer_pool/README.md
+new file mode 100644
+--- /dev/null
++++ b/tests/regression/upload_buffer_pool/README.md
+@@ -0,0 +1,25 @@
++# Upload buffer pool regressions
++
++Run from any directory with Python 3 and a C++23 compiler:
++
++```
++python3 tests/regression/upload_buffer_pool/run.py
++python3 tests/regression/upload_buffer_pool/run.py --sanitize
++```
++
++`CXX` selects the compiler. The sanitizer option requires AddressSanitizer and
++UndefinedBehaviorSanitizer support. If LeakSanitizer is unavailable under a
++traced container, `ASAN_OPTIONS=detect_leaks=0` disables only leak detection;
++`edge_tests.cpp` separately checks tracked page destruction.
++
++The generic pool tests compile the production `.cpp` and SDK headers directly.
++They cover normal allocation, initial/repeated allocation failure, page rollover,
++reclaim/retry, partial requests, alignment, flush ranges, list ownership,
++timeline changes and page destruction.
++
++`check_d3d_ownership.py` compiles the exact production page-creation method body
++against deterministic COM/device test doubles. It checks creation failure, Map
++failure and successful page ownership. Its optional argument is a source file
++for negative-control testing. This is not a Windows D3D runtime/device test.
++
++These tests require no game data and do not launch the game.
+diff --git a/tests/regression/upload_buffer_pool/check_d3d_ownership.py b/tests/regression/upload_buffer_pool/check_d3d_ownership.py
+new file mode 100644
+--- /dev/null
++++ b/tests/regression/upload_buffer_pool/check_d3d_ownership.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Compile the production page-creation body against a deterministic COM test double.
++
++This checks ownership, not Windows/D3D behavior. No GPU or game assets required.
++"""
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++
++root = Path(__file__).resolve().parents[3]
++source_path = Path(sys.argv[1]) if len(sys.argv) > 1 else root / 'src/ui/d3d12/d3d12_upload_buffer_pool.cpp'
++source = source_path.read_text()
++start = source.index('GraphicsUploadBufferPool::Page* D3D12UploadBufferPool::CreatePageImplementation() {')
++end = source.index('\nD3D12UploadBufferPool::D3D12Page::D3D12Page', start)
++body = source[start:end]
++prefix = r'''
++#include <cstddef>
++#include <cstdlib>
++#include <iostream>
++#define CHECK(x) do { if (!(x)) { std::cerr << "CHECK failed: " #x << '\n'; std::exit(1); } } while (0)
++using HRESULT = int;
++#define FAILED(x) ((x) < 0)
++#define REXLOG_ERROR(...) ((void)0)
++#define IID_PPV_ARGS(x) (x)
++constexpr int D3D12_RESOURCE_FLAG_NONE = 0, D3D12_RESOURCE_STATE_GENERIC_READ = 0;
++struct D3D12_RESOURCE_DESC {};
++struct D3D12_RANGE { size_t Begin, End; };
++struct ID3D12Resource {
++  int refs = 0, releases = 0;
++  bool map_fails = false;
++  void AddRef() { ++refs; }
++  void Release() { ++releases; --refs; }
++  HRESULT Map(int, D3D12_RANGE*, void** out) { if (map_fails) return -1; *out = this; return 0; }
++};
++namespace Microsoft::WRL {
++template<class T> class ComPtr {
++  T* ptr = nullptr;
++ public:
++  ComPtr() = default;
++  ComPtr(const ComPtr&) = delete;
++  ~ComPtr() { if (ptr) ptr->Release(); }
++  T* operator->() { return ptr; }
++  T** operator&() { return &ptr; }
++  T* Get() { return ptr; }
++};
++}
++namespace util {
++int kHeapPropertiesUpload;
++void FillBufferResourceDesc(D3D12_RESOURCE_DESC&, size_t, int) {}
++}
++struct Device {
++  ID3D12Resource resource;
++  bool create_fails = false;
++  HRESULT CreateCommittedResource(int*, int, D3D12_RESOURCE_DESC*, int, void*, ID3D12Resource** out) {
++    if (create_fails) return -1;
++    resource.refs = 1; *out = &resource; return 0;
++  }
++};
++struct Provider {
++  Device device;
++  Device* GetDevice() { return &device; }
++  int GetHeapFlagCreateNotZeroed() { return 0; }
++};
++struct GraphicsUploadBufferPool { struct Page { virtual ~Page() = default; }; };
++struct D3D12UploadBufferPool {
++  Provider provider_;
++  size_t page_size_ = 64;
++  struct D3D12Page : GraphicsUploadBufferPool::Page {
++    ID3D12Resource* buffer;
++    D3D12Page(ID3D12Resource* b, void*) : buffer(b) { buffer->AddRef(); }
++    ~D3D12Page() override { buffer->Release(); }
++  };
++  GraphicsUploadBufferPool::Page* CreatePageImplementation();
++};
++'''
++suffix = r'''
++int main() {
++  { D3D12UploadBufferPool p; p.provider_.device.create_fails = true;
++    CHECK(!p.CreatePageImplementation()); CHECK(p.provider_.device.resource.releases == 0); }
++  { D3D12UploadBufferPool p; auto& r = p.provider_.device.resource; r.map_fails = true;
++    CHECK(!p.CreatePageImplementation()); CHECK(r.releases == 1); CHECK(r.refs == 0); }
++  { D3D12UploadBufferPool p; auto& r = p.provider_.device.resource;
++    auto* page = p.CreatePageImplementation(); CHECK(page); CHECK(r.refs == 1);
++    delete page; CHECK(r.refs == 0); CHECK(r.releases == 2); }
++  std::cout << "D3D ownership: create failure, map failure, success PASS\n";
++}
++'''
++with tempfile.TemporaryDirectory() as tmp:
++    cpp = Path(tmp) / 'ownership.cpp'
++    exe = Path(tmp) / 'ownership'
++    cpp.write_text(prefix + body + suffix)
++    subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', '-Wall', '-Wextra', '-Werror', str(cpp), '-o', str(exe)], check=True)
++    subprocess.run([str(exe)], check=True)
+diff --git a/tests/regression/upload_buffer_pool/edge_tests.cpp b/tests/regression/upload_buffer_pool/edge_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/regression/upload_buffer_pool/edge_tests.cpp
+@@ -0,0 +1,24 @@
++#include <rex/ui/graphics_upload_buffer_pool.h>
++#include <cassert>
++#include <set>
++#include <vector>
++#include <tuple>
++#include <cstdio>
++struct Pool : rex::ui::GraphicsUploadBufferPool {
++  Pool():GraphicsUploadBufferPool(64){}
++  struct Tracked : Page { static inline int live=0; Tracked(){++live;} ~Tracked(){--live;} };
++  bool fail=false; int created=0;
++  std::vector<std::tuple<Page*,size_t,size_t>> flushes;
++  Page* req(size_t n,size_t& o,size_t a=1,uint64_t s=1){return Request(s,n,a,o);}
++  Page* part(size_t n,size_t& o,size_t& got,size_t a=1){return RequestPartial(1,n,a,o,got);}
++  Page* CreatePageImplementation()override {if(fail)return nullptr; ++created; return new Tracked;}
++  void FlushPageWrites(Page*p,size_t o,size_t n)override {assert(p);assert(o+n<=64);flushes.emplace_back(p,o,n);}
++  void valid(){std::set<Page*> all;Page*last=nullptr;for(auto*p=writable_first_;p;p=p->next_){assert(all.insert(p).second);last=p;}assert(last==writable_last_);last=nullptr;for(auto*p=submitted_first_;p;p=p->next_){assert(all.insert(p).second);last=p;}assert(last==submitted_last_);assert((int)all.size()==Tracked::live);assert(current_page_flushed_<=current_page_used_);assert(current_page_used_<=64);assert(writable_first_||!current_page_used_);}
++};
++int main(){size_t o,n;
++ {Pool p;p.ChangeSubmissionTimeline();p.ChangeSubmissionTimeline();p.Reclaim(99);p.valid();}
++ {Pool p;auto*a=p.req(48,o);p.FlushWrites();assert(p.flushes.size()==1);p.fail=true;assert(!p.req(32,o));p.FlushWrites();assert(p.flushes.size()==1);p.valid();p.ChangeSubmissionTimeline();p.valid();assert(p.req(32,o)==a&&o==0);p.FlushWrites();assert(p.flushes.size()==2);p.valid();}
++ {Pool p;auto*a=p.req(48,o);auto*b=p.req(32,o);assert(a!=b);p.ChangeSubmissionTimeline();p.valid();p.ChangeSubmissionTimeline();p.valid();assert(p.req(32,o)==b&&o==32);assert(p.req(64,o)==a&&o==0);p.valid();p.Reclaim(1);p.valid();p.ClearCache();p.valid();}
++ {Pool p;auto*a=p.req(64,o);p.fail=true;assert(!p.part(32,o,n,16));p.Reclaim(1);assert(p.part(32,o,n,16)==a&&o==0&&n==32);p.valid();}
++ {Pool p;auto*a=p.req(33,o);p.fail=true;assert(!p.req(32,o,16));p.Reclaim(0);p.valid();assert(!p.req(32,o,16));p.Reclaim(1);assert(p.req(32,o,16)==a&&o==0);p.valid();}
++ assert(Pool::Tracked::live==0);puts("edge tests PASS");}
+diff --git a/tests/regression/upload_buffer_pool/run.py b/tests/regression/upload_buffer_pool/run.py
+new file mode 100644
+--- /dev/null
++++ b/tests/regression/upload_buffer_pool/run.py
+@@ -0,0 +1,26 @@
++#!/usr/bin/env python3
++"""Standalone tests of the production generic pool and D3D ownership body."""
++import argparse
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++
++parser = argparse.ArgumentParser()
++parser.add_argument('--sanitize', action='store_true', help='enable ASan and UBSan (compiler support required)')
++args = parser.parse_args()
++here = Path(__file__).resolve().parent
++root = here.parents[2]
++cases = ['initial_failure', 'rollover_failure', 'reclaim_after_failure', 'timeline_writable_only', 'normal']
++with tempfile.TemporaryDirectory() as tmp:
++    for name in ['upload_pool_test', 'edge_tests']:
++        exe = Path(tmp) / name
++        command = [os.environ.get('CXX', 'c++'), '-std=c++23', '-Wall', '-Wextra', '-I', str(root / 'include')]
++        if args.sanitize:
++            command += ['-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
++        command += [str(here / (name + '.cpp')), str(root / 'src/ui/graphics_upload_buffer_pool.cpp'), '-o', str(exe)]
++        subprocess.run(command, check=True)
++        for case in cases if name == 'upload_pool_test' else [None]:
++            subprocess.run([str(exe)] + ([case] if case else []), check=True)
++subprocess.run([sys.executable, str(here / 'check_d3d_ownership.py')], check=True)
+diff --git a/tests/regression/upload_buffer_pool/upload_pool_test.cpp b/tests/regression/upload_buffer_pool/upload_pool_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/regression/upload_buffer_pool/upload_pool_test.cpp
+@@ -0,0 +1,40 @@
++#include <rex/ui/graphics_upload_buffer_pool.h>
++#include <cstdlib>
++#include <iostream>
++#include <string>
++#define CHECK(x) do { if (!(x)) { std::cerr << "CHECK failed: " #x << '\n'; std::exit(1); } } while (0)
++class Pool : public rex::ui::GraphicsUploadBufferPool {
++ public:
++  Pool() : GraphicsUploadBufferPool(64) {}
++  bool fail = false;
++  int created = 0, flushed = 0;
++  Page* request(size_t size, size_t& offset) { return Request(1, size, 1, offset); }
++  void check_empty_cursor() { CHECK(current_page_used_ == 0); CHECK(current_page_flushed_ == 0); }
++  void check_tail() { CHECK(writable_first_); CHECK(writable_last_); }
++ protected:
++  Page* CreatePageImplementation() override { if (fail) return nullptr; ++created; return new Page; }
++  void FlushPageWrites(Page* page, size_t, size_t) override { CHECK(page); ++flushed; }
++};
++int main(int argc, char** argv) {
++  CHECK(argc == 2); std::string test = argv[1]; Pool p; size_t offset = 999;
++  if (test == "initial_failure") {
++    p.fail = true; CHECK(!p.request(16, offset)); p.check_empty_cursor(); p.FlushWrites();
++    p.fail = false; CHECK(p.request(16, offset)); CHECK(offset == 0);
++  } else if (test == "rollover_failure") {
++    CHECK(p.request(48, offset)); p.fail = true; CHECK(!p.request(32, offset));
++    p.check_empty_cursor(); p.FlushWrites(); CHECK(!p.request(32, offset));
++    p.fail = false; CHECK(p.request(32, offset)); CHECK(offset == 0); CHECK(p.created == 2);
++  } else if (test == "reclaim_after_failure") {
++    auto* original = p.request(48, offset); CHECK(original); p.fail = true; CHECK(!p.request(32, offset));
++    p.Reclaim(1); CHECK(p.request(32, offset) == original); CHECK(offset == 0); CHECK(p.created == 1);
++  } else if (test == "timeline_writable_only") {
++    CHECK(p.request(16, offset)); p.ChangeSubmissionTimeline(); p.check_tail();
++    CHECK(p.request(16, offset)); CHECK(offset == 16);
++  } else if (test == "normal") {
++    auto* first = p.request(32, offset); CHECK(first); CHECK(offset == 0);
++    CHECK(p.request(32, offset) == first); CHECK(offset == 32);
++    CHECK(p.request(32, offset) != first); CHECK(offset == 0);
++    p.Reclaim(1); p.ChangeSubmissionTimeline(); p.check_tail();
++  } else { CHECK(false); }
++  std::cout << test << " PASS\n";
++}
