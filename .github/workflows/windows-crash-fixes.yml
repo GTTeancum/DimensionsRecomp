@@ -1,0 +1,122 @@
+name: Windows native Toy Pad crash fixes
+on:
+  push:
+    branches: [codex/windows-crash-fixes-20261017]
+    paths:
+      - '.github/workflows/windows-crash-fixes.yml'
+      - 'docs/rexglue-sdk-upload-pool-fixes.patch'
+      - 'docs/native-toypad-sdk.patch'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-dlls:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out matching SDK baseline
+        uses: actions/checkout@v4
+        with:
+          repository: NeverCookFirst/rexglue-sdk
+          ref: ee34f28f9e886c3bff2ea8f9ea83f48aff497e58
+          path: sdk
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Prepare Windows build tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install llvm cmake ninja -y --no-progress
+          if ($LASTEXITCODE -notin @(0,3010)) { throw 'Tool installation failed' }
+          'C:\Program Files\LLVM\bin' | Out-File -Append $env:GITHUB_PATH
+          'C:\Program Files\CMake\bin' | Out-File -Append $env:GITHUB_PATH
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'Visual Studio x64 tools are unavailable' }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          cmd /s /c "`"`"$devcmd`" -arch=x64 -host_arch=x64 >nul && set`"" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $_ -notmatch '^(GITHUB_|RUNNER_|NODE_OPTIONS=)') { "$($Matches[1])=$($Matches[2])" | Out-File -Append $env:GITHUB_ENV }
+          }
+          if ($LASTEXITCODE) { throw 'Visual Studio environment setup failed' }
+      - name: Apply native Toy Pad and crash fixes
+        shell: pwsh
+        working-directory: sdk
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git apply --check ../docs/native-toypad-sdk.patch
+          if ($LASTEXITCODE) { throw 'Native patch check failed' }
+          git apply ../docs/native-toypad-sdk.patch
+          if ($LASTEXITCODE) { throw 'Native patch failed' }
+          git apply --check ../docs/rexglue-sdk-upload-pool-fixes.patch
+          if ($LASTEXITCODE) { throw 'Crash patch check failed' }
+          git apply ../docs/rexglue-sdk-upload-pool-fixes.patch
+          if ($LASTEXITCODE) { throw 'Crash patch failed' }
+      - name: Materialize libmspack link placeholders
+        shell: python
+        run: |
+          import pathlib, subprocess
+          root = pathlib.Path('sdk/thirdparty/libmspack').resolve()
+          entries = subprocess.check_output(['git', '-C', str(root), 'ls-files', '-s'], text=True)
+          count = 0
+          for line in entries.splitlines():
+              meta, name = line.split('\t', 1)
+              if not meta.startswith('120000 '):
+                  continue
+              path = root / name
+              if path.is_symlink():
+                  continue
+              target_text = subprocess.check_output(['git', '-C', str(root), 'show', 'HEAD:' + name], text=True).strip()
+              target = (path.parent / target_text).resolve()
+              if not target.is_relative_to(root) or not target.is_file():
+                  raise RuntimeError('Unsafe or missing libmspack link target: ' + name)
+              path.write_bytes(target.read_bytes())
+              count += 1
+          print('Materialized', count, 'libmspack link placeholders')
+      - name: Configure matching native build
+        shell: pwsh
+        working-directory: sdk
+        run: |
+          clang --version
+          cmake --version
+          ninja --version
+          cmake --preset win-amd64 -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DREXGLUE_USE_D3D12=ON -DREXGLUE_USE_VULKAN=OFF -DREXGLUE_ENABLE_FIDELITYFX=OFF -DCMAKE_EXPORT_NO_PACKAGE_REGISTRY=ON
+          if ($LASTEXITCODE) { throw 'Configure failed' }
+      - name: Build Windows release DLLs
+        shell: pwsh
+        working-directory: sdk
+        run: |
+          cmake --build out/build/win-amd64 --config Release --target rexruntime rexgpu-xenos --parallel 2
+          if ($LASTEXITCODE) { throw 'Build failed' }
+      - name: Package binaries and provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item sdk/out/win-amd64/Release/rexruntime.dll package/
+          Copy-Item sdk/out/win-amd64/Release/rexgpu-xenos.dll package/
+          & dumpbin /exports package/rexruntime.dll | Out-File package/runtime-exports.txt
+          if ($LASTEXITCODE) { throw 'Export inspection failed' }
+          & dumpbin /dependents package/rexruntime.dll | Out-File package/runtime-dependencies.txt
+          if ($LASTEXITCODE) { throw 'Dependency inspection failed' }
+          & dumpbin /dependents package/rexgpu-xenos.dll | Out-File package/gpu-dependencies.txt
+          if ($LASTEXITCODE) { throw 'GPU dependency inspection failed' }
+          @"
+          Windows x64 Release, x86-64-v2, D3D12 ON; Vulkan and FidelityFX OFF.
+          For the native Toy Pad build based on SDK ee34f28f9e886c3bff2ea8f9ea83f48aff497e58.
+          Includes the native Toy Pad patch and three upload-buffer error-path fixes.
+          This is not the unmodified upstream 0.1.36 runtime.
+          Workflow source commit: $env:GITHUB_SHA
+          Build-only validation; gameplay and hardware behavior remain unverified.
+          No original game assets included. No automatic installation is performed.
+          "@ | Set-Content package/README.txt
+          Get-FileHash package/*.dll -Algorithm SHA256 | Format-List | Out-File package/SHA256SUMS.txt
+          Get-FileHash docs/native-toypad-sdk.patch,docs/rexglue-sdk-upload-pool-fixes.patch -Algorithm SHA256 | Format-List | Out-File package/PATCH-SHA256SUMS.txt
+          Copy-Item docs/rexglue-sdk-upload-pool-fixes.patch package/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Dimensions-native-toypad-crash-fixes-win64
+          path: package/
+          if-no-files-found: error
+          retention-days: 14
