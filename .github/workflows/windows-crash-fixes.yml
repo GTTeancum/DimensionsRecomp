@@ -21,9 +21,17 @@ jobs:
           repository: NeverCookFirst/rexglue-sdk
           ref: ee34f28f9e886c3bff2ea8f9ea83f48aff497e58
           path: sdk
-          submodules: recursive
+          submodules: false
           fetch-depth: 0
           fetch-tags: true
+      - name: Initialize declared SDK dependencies
+        shell: pwsh
+        working-directory: sdk
+        run: |
+          $paths = git config --file .gitmodules --get-regexp '^submodule\..*\.path$' | ForEach-Object { ($_ -split ' ', 2)[1] }
+          if (!$paths) { throw 'No declared dependencies found' }
+          git submodule update --init --recursive -- $paths
+          if ($LASTEXITCODE) { throw 'Dependency checkout failed' }
       - name: Prepare Windows build tools
         shell: pwsh
         run: |
@@ -114,6 +122,18 @@ jobs:
           Get-FileHash package/*.dll -Algorithm SHA256 | Format-List | Out-File package/SHA256SUMS.txt
           Get-FileHash docs/native-toypad-sdk.patch,docs/rexglue-sdk-upload-pool-fixes.patch -Algorithm SHA256 | Format-List | Out-File package/PATCH-SHA256SUMS.txt
           Copy-Item docs/rexglue-sdk-upload-pool-fixes.patch package/
+          Copy-Item sdk/LICENSE package/SDK-LICENSE.txt
+          New-Item -ItemType Directory -Force package/licenses | Out-Null
+          Get-ChildItem sdk/thirdparty -Recurse -File | Where-Object { $_.Name -match '^(LICENSE|COPYING|NOTICE)([.-].*)?$' } | ForEach-Object {
+            $rel = [IO.Path]::GetRelativePath((Resolve-Path sdk/thirdparty), $_.FullName)
+            $dest = Join-Path package/licenses $rel
+            New-Item -ItemType Directory -Force (Split-Path $dest) | Out-Null
+            Copy-Item $_.FullName $dest
+          }
+          $exports = Get-Content package/runtime-exports.txt -Raw
+          foreach ($symbol in @('ConfigureNativeRosterChord', 'ConsumeNativeRosterOpenRequest', 'ReleaseNativeRosterInput', 'HeldLeftStick')) {
+            if ($exports -notmatch $symbol) { throw "Native Toy Pad export missing: $symbol" }
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: Dimensions-native-toypad-crash-fixes-win64
