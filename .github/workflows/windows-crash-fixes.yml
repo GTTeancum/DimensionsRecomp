@@ -58,6 +58,15 @@ jobs:
             }
           }
           if ($LASTEXITCODE) { throw 'Visual Studio environment setup failed' }
+      - name: Normalize patch line endings
+        shell: python
+        run: |
+          import pathlib, hashlib
+          for name in ['native-toypad-sdk.patch', 'rexglue-sdk-upload-pool-fixes.patch']:
+              path = pathlib.Path('docs') / name
+              data = path.read_bytes().replace(b'\r\n', b'\n')
+              path.write_bytes(data)
+              print(name, hashlib.sha256(data).hexdigest())
       - name: Apply native Toy Pad and crash fixes
         shell: pwsh
         working-directory: sdk
