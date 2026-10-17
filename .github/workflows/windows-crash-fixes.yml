@@ -44,8 +44,18 @@ jobs:
           $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (!$vs) { throw 'Visual Studio x64 tools are unavailable' }
           $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
-          cmd /s /c "`"`"$devcmd`" -arch=x64 -host_arch=x64 >nul && set`"" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$' -and $_ -notmatch '^(GITHUB_|RUNNER_|NODE_OPTIONS=)') { "$($Matches[1])=$($Matches[2])" | Out-File -Append $env:GITHUB_ENV }
+          $batch = Join-Path $env:RUNNER_TEMP 'dimensions-vs-env.cmd'
+          @"
+          @echo off
+          call "$devcmd" -arch=x64 -host_arch=x64 >nul
+          if errorlevel 1 exit /b 1
+          set
+          "@ | Set-Content -Encoding ascii $batch
+          cmd /c $batch | ForEach-Object {
+            $parts = $_ -split '=', 2
+            if ($parts.Count -eq 2 -and $parts[0] -notmatch '^(GITHUB_|RUNNER_|NODE_OPTIONS$)') {
+              "$($parts[0])=$($parts[1])" | Out-File -Append $env:GITHUB_ENV
+            }
           }
           if ($LASTEXITCODE) { throw 'Visual Studio environment setup failed' }
       - name: Apply native Toy Pad and crash fixes
